@@ -1,0 +1,5 @@
+# frlg-ldn-trade runtime dependencies (tested versions; install into a venv)
+ldn==0.0.17
+pycryptodome==3.23.0
+trio==0.33.0
+zstandard==0.25.0
