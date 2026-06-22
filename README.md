@@ -33,6 +33,13 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 | AMD RZ616        | Internal (M.2) | mt7921e | Low          |
 | ALFA AWUS036ACHM | External       | mt76x0u | High         |
 
+### Known Problematic WiFi Cards
+
+| Model            | Type           | Driver  | Issue        |
+|------------------|----------------|---------|---------------
+| Intel AX200        | Internal (M.2) | iwlwifi | Unable to be assigned ip |
+| Atheros AR9271 | External       | ath9k_htc | Unable to be assigned ip (most of the time) |
+
 ## Usage
 ```sudo -E ./venv/bin/python frlgtrade.py --live -o output.pk3 PARTY1.pk3 PARTY2.pk3```
 
