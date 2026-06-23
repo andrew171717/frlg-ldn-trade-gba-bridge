@@ -20,7 +20,7 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 
 ## Requirements
 - Linux
-- Python 3.9+, and a venv with requirements installed (see requirements.txt)
+- Python 3.12+, and a venv with requirements installed (see requirements.txt)
 - a compatible WiFi card (see below)
 - A Switch or Switch 2 with FRLG, played to the point where the Direct Corner has been unlocked (~20-40 minutes)
 - At least 2 .pk3 files to serve as simulated party members/trade fodder
