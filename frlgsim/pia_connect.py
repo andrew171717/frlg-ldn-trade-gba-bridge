@@ -73,7 +73,7 @@ def build_net_property_ack(seqid):
 def parse_net_conn_request(payload):
     """Pull the host's identity out of a Net 0x11 connection request. The Net body is
     `[u32 ?][host var-id u16][host constant id = MAC(6) + 0000]...`; returns (host_var, host_mac).
-    CRITICAL: the host's Pia CONSTANT ID is the gba-app's fixed virtual GBA-adapter MAC
+    CRITICAL: the host's Pia CONSTANT ID is the emulator's fixed virtual GBA-adapter MAC
     (e5395b69d280 - identical across different physical Switches), NOT the console's LDN/WiFi MAC
     from the participant list. The Session join MUST address this constant id or the host ignores
     it. Learn it from the wire rather than from `network.info().participants`."""
@@ -115,10 +115,10 @@ def build_rtt_response(request):
 
 
 def build_rtt_request(template, systime):
-    """Originate a guest type-0 RTT request (observed: ~5.9/s on dst=0x0001). Clone the
-    host's last request `template` (so the layout/subject are byte-faithful) and set type=0 (LE) with a
-    fresh incrementing `systime` (the host echoes it in a type-1 response we then ignore - we only need
-    to BE SEEN probing so the host's RTT layer keeps our slot live)."""
+    """Originate a guest type-0 RTT request (~5.9/s on dst=0x0001). Clone the host's last request
+    `template` (so the layout/subject are byte-faithful) and set type=0 (LE) with a fresh incrementing
+    `systime`. The host echoes it in a type-1 response; matching the echoed systime to the send tick
+    gives the round-trip that drives the reliable RTO (and keeps our slot live in the host's RTT layer)."""
     b = bytearray(template[:21].ljust(21, b"\x00"))
     b[0] = 0                                          # type = request (BYTE 0); preserve the template's
     b[8:16] = (systime & ((1 << 64) - 1)).to_bytes(8, "little")   # version byte [3] + layout, fresh systime
@@ -205,6 +205,11 @@ class ConnectionManager:
         self._last_host_rtt = None
         self._rtt_systime = 0x10000
         self._rtt_orig_tick = -10 ** 9
+        # RTT measurement: each originated request's systime -> the tick it was sent, so the matching
+        # type-1 response yields a round-trip. Completed round-trips (in ticks) accumulate in rtt_samples
+        # for the caller to drain and feed into the reliable layer's RTO; the reliable RTO is RTT-driven.
+        self._rtt_pending = {}
+        self.rtt_samples = []
 
     def maybe_originate_rtt(self, tick):
         """Once connected, ORIGINATE a type-0 RTT request every RTT_ORIGINATE_PERIOD VBlanks (a liveness
@@ -216,6 +221,11 @@ class ConnectionManager:
             return
         self._rtt_orig_tick = tick
         self._rtt_systime = (self._rtt_systime + 1) & ((1 << 64) - 1)
+        # remember when we sent this systime so the host's type-1 echo gives us the round-trip
+        self._rtt_pending[self._rtt_systime] = tick
+        if len(self._rtt_pending) > 64:                     # bound it if responses are being lost
+            for k in sorted(self._rtt_pending, key=self._rtt_pending.get)[:32]:
+                del self._rtt_pending[k]
         self._q(PROTO_RTT, build_rtt_request(self._last_host_rtt, self._rtt_systime),
                 SESSION_VAR, self.our_var, False, True, False, footer_var=self.host_var)
 
@@ -243,9 +253,8 @@ class ConnectionManager:
                              "compress": compress, "footer": footer, "establishing": establishing,
                              "unicast": True, "pktid": pktid, "footer_var": footer_var})
 
-    def on_message(self, proto, payload):
-        """React to a decoded IN Pia message; queue the ack-gated reply. The exact framing per stage
-        is verified byte-for-byte vs the reference capture:
+    def on_message(self, proto, payload, tick=None):
+        """React to a decoded IN Pia message; queue the ack-gated reply. The exact framing per stage:
           * Net 0x12   -> hdr(dst=0, src=0),                 establishing (pktid 0, flag 0x02), no footer, uncompressed.
           * Session join -> hdr(dst=0, src=OUR_var),         establishing, no footer, zstd-COMPRESSED.
           * Session finalize -> hdr(dst=host_var, src=our_var), established, footer=host_var, uncompressed.
@@ -253,7 +262,7 @@ class ConnectionManager:
         if proto == PROTO_NET:
             n = parse_net(payload)
             if n and n[1] == NET_CONN_REQUEST and self.state == ST_NET:
-                # The host's Net 0x11 carries its TRUE Pia constant id (gba-app virtual MAC) + var
+                # The host's Net 0x11 carries its TRUE Pia constant id (emulator virtual MAC) + var
                 # id; learn both from the wire (the participant-list MAC is a DIFFERENT identifier
                 # and addressing it makes the host ignore our join). [parse_net_conn_request]
                 req = parse_net_conn_request(payload)
@@ -298,12 +307,24 @@ class ConnectionManager:
                 self.state = ST_CONNECTED
                 self.log("host live (RTT/Reliable) -> CONNECTED")
                 self.info("Connection established.")
+            # Answer the host's RTT requests once we are past ST_NET (have finalized). The native does NOT
+            # answer RTT during the pre-finalize window (byte-checked vs frlg2: zero RTT responses across the
+            # whole 0.3-2.1s join), so we don't either - the pre-OK deadlock was NOT a liveness drop; it was
+            # the connect-phase J/C reliable frames being sent once and never retransmitted (fixed via the
+            # reliable layer's connect bootstrap RTO, sim.py RTO_BOOTSTRAP_MS).
             if proto == PROTO_RTT and self.state != ST_NET and self.host_var is not None:
                 r = parse_rtt(payload)
-                if r and r["type"] == 0:                  # host request -> respond (ignore type-1)
+                if r and r["type"] == 0:                  # host request -> respond
                     self._last_host_rtt = bytes(payload[:21])   # template for our own origination
                     self._q(PROTO_RTT, build_rtt_response(payload),
                             SESSION_VAR, self.our_var, False, True, False, footer_var=self.host_var)
+                elif r and r["type"] == 1 and tick is not None:
+                    # type-1 = the host echoing one of OUR originated requests. Match its systime to the
+                    # tick we sent it and record the round-trip; this feeds the reliable RTO.
+                    systime = int.from_bytes(r["systime"], "little")
+                    sent = self._rtt_pending.pop(systime, None)
+                    if sent is not None and tick >= sent:
+                        self.rtt_samples.append(tick - sent)
 
     def drain(self):
         out, self._outbox = self._outbox, []
