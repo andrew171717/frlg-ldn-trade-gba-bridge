@@ -141,8 +141,8 @@ class BlockSender:
         # re-send-until-the-host-confirms loop. The decomp loop is FAITHFUL to the Switch (its
         # HandleBlockSend/SendNextBlock/SendLastBlock/HandleSendFailure have ZERO REVISION branches -
         # a real Switch re-sends identically), but it exists for the GBA's LOSSY raw RFU adapter. Over
-        # our high-RTT bridge the gba-app tunnels through Pia's RELIABLE layer, so Pia already delivers
-        # (+retransmits) every fragment; the gba-app re-send is then pure REDUNDANCY that floods Pia
+        # our high-RTT bridge the emulator tunnels through Pia's RELIABLE layer, so Pia already delivers
+        # (+retransmits) every fragment; the emulator re-send is then pure REDUNDANCY that floods Pia
         # (verified: 335 reliable frames generated for a 17-fragment block; Pia delivered 327, the host
         # RFU faulted on the redundant torrent). On a real Switch-to-Switch LDN the host confirms in one
         # quick round-trip so the loop never accumulates; only our bridge's latency turns it into a flood.

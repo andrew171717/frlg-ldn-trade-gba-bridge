@@ -1,7 +1,7 @@
 """librfu NI (reliable, acknowledged) sender state machine - the CHILD's post-'A' game-data
 handshake [src/librfu_rfu.c rfu_STC_NI_constructLLSF:1808, rfu_STC_setSendData_org:1423].
 
-After the host accepts our gba-app connect ('A'), the real child runs the librfu NI sender to
+After the host accepts our emulator connect ('A'), the real child runs the librfu NI sender to
 deliver its RfuGameData ("connection-all-slots", rfu_NI_CreateConnectionAllSlots,
 src/librfu_rfu.c:1418-1421: ni_or_uni=0x40, dataType=1, src=&my.serialNo, dataSize=26) before any
 UNI trade traffic. The NI machine windows the data over WINDOW_COUNT=4 phases with per-phase n[]

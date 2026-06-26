@@ -7,7 +7,7 @@ behaviour is specified module-by-module; every module here cites the relevant de
 
 Layer stack (bottom-up), one per-VBlank RFU command slot becomes:
     14-byte RFU slot (rfu.py)
-      -> gba-app 0x54 frame (gbaframe.py)
+      -> emulator 0x54 frame (gbaframe.py)
         -> Reliable(10) + Pia message (reliable.py)
           -> zstd (optional) + Pia AES-GCM (crypto.py)
             -> UDP :12345 (transport.py)

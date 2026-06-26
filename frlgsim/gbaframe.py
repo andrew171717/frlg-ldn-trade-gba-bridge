@@ -1,4 +1,4 @@
-"""gba-app 0x54 frame - the Switch adapter's wrapper around the RFU command slot.
+"""emulator 0x54 frame - the Switch adapter's wrapper around the RFU command slot.
 
 A gba frame = `57 <type:1> <len:u16 LE> <body>`. types: C=0x43 A=0x41 T=0x54 K=0x4b. (The session
 metadata/config-game-data is NOT a 0x57 frame - it is a Reliable INIT payload owned by
@@ -16,24 +16,24 @@ ts; the host sends us NO K. Builders: wrap_t/build_k (OUT), parse_in (IN host), 
 
 GBA_MARKER = 0x57
 TYPE_T = 0x54           # RFU command-slot carrier
-TYPE_K = 0x4B           # gba-app ack of a received host 'T'
+TYPE_K = 0x4B           # emulator ack of a received host 'T'
 SLOT_LEN = 14
 
 
-# gba-app RFU control frame types (ASCII mnemonics): 'J'=join/metadata(configGameData),
+# emulator RFU control frame types (ASCII mnemonics): 'J'=join/metadata(configGameData),
 # 'C'=connect request (rfu_REQ_startConnectParent), 'A'=host accept, 'K'=data ack, 'T'=slot data.
 TYPE_J, TYPE_C, TYPE_A = 0x4A, 0x43, 0x41
-TYPE_D = 0x44           # host gba-app DISCONNECT ('D' = 57 44 02 00 <parent_pid>)
+TYPE_D = 0x44           # host emulator DISCONNECT ('D' = 57 44 02 00 <parent_pid>)
 
 
 def build_gba_frame(ftype, data):
-    """gba-app control frame = 57 <type> <len:u16 LE> <data> (the J/C connect frames; the
+    """emulator control frame = 57 <type> <len:u16 LE> <data> (the J/C connect frames; the
     'T'/'K' data frames use the dedicated wrap_t/build_k builders)."""
     return bytes([GBA_MARKER, ftype]) + len(data).to_bytes(2, "little") + bytes(data)
 
 
 def build_connect(parent_pid):
-    """The joiner's gba-app RFU connection request [reference capture #16: 57 43 02 00 67 79]. `parent_pid` is
+    """The joiner's emulator RFU connection request [reference capture #16: 57 43 02 00 67 79]. `parent_pid` is
     the PARENT's RFU id (2 bytes) the child connects to (rfu_REQ_startConnectParent(pid)
     [librfu_rfu.c:753]) - LEARNED from the parent's search beacon, never guessed. The host echoes it
     in its accept (0x41: <child_id> <parent_pid> 0000)."""
@@ -56,7 +56,7 @@ def wrap_t(slot, ts):
 
 
 def build_k(k_seq, mid, acked_ts):
-    """Build a 'K' (0x4b) gba-app ack frame [reference capture, verified]: 57 4b 0c 00 <k_seq:u32><mid:u32>
+    """Build a 'K' (0x4b) emulator ack frame [reference capture, verified]: 57 4b 0c 00 <k_seq:u32><mid:u32>
     <acked_host_ts:u32> (all LE). One per UNIQUE host 'T' ts; k_seq is joiner-global (+1 from 1);
     mid = 1-based position within the OUT Pia datagram; acked_ts = the host 'T's ts verbatim."""
     body = ((k_seq & 0xFFFFFFFF).to_bytes(4, "little")

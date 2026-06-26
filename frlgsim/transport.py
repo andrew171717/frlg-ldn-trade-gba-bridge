@@ -26,10 +26,10 @@ PIA_PORT = 12345
 
 
 def _dump_beacon(app_data, log):
-    """Dump the LDN advertisement application data (the gba-app's RFU SEARCH BEACON). The parent's
-    RFU id - which the child must echo in its gba-app connect ('C') frame [decomp: the child reads
+    """Dump the LDN advertisement application data (the emulator's RFU SEARCH BEACON). The parent's
+    RFU id - which the child must echo in its emulator connect ('C') frame [decomp: the child reads
     partner[].id from the parent's beacon; rfu_REQ_startConnectParent] - is carried in here. The
-    wiki documents only the Pia 6.16-6.41 system header (0x5C bytes); the gba-app payload after it
+    wiki documents only the Pia 6.16-6.41 system header (0x5C bytes); the emulator payload after it
     is undocumented, so dump it RAW to locate the parent id from real data (no guessing)."""
     if not app_data:
         log("[live] beacon: NO application_data on the advertisement (cannot locate parent RFU id)")
@@ -37,7 +37,7 @@ def _dump_beacon(app_data, log):
     log(f"[live] beacon application_data ({len(app_data)} B): {app_data.hex()}")
     if len(app_data) >= 0x5C:
         gba = app_data[0x5C:]
-        log(f"[live] beacon gba-app payload (after the 0x5C Pia system header, {len(gba)} B): "
+        log(f"[live] beacon emulator payload (after the 0x5C Pia system header, {len(gba)} B): "
             f"{gba.hex()}")
     # orient the structure: printable ASCII runs (gname/username) + where the reference capture's parent id recurs.
     runs = []
@@ -187,8 +187,8 @@ def tune_iface(iface, keep_ip, broadcast_ip, log=print):
     except Exception as e:
         log(f"[live] stray-address cleanup skipped: {e}")
 
-# The NSO "gba-app" LDN passphrase (NintendoClients wiki "LDN Passphrases"). It belongs to the
-# GBA-VC emulator container, not the ROM, so it is SHARED across its titles: FRLG today, and
+# The emulator's LDN passphrase (NintendoClients wiki "LDN Passphrases"). It belongs to the
+# GBA emulator container, not the ROM, so it is SHARED across its titles: FRLG today, and
 # Ruby/Sapphire/Emerald when they are re-released. It is ONE 64-byte value (the two 32-byte halves
 # concatenate - earlier code mislabeled the second half as an "alternate"). Hardcoded as the
 # default so no --password is needed.
@@ -258,7 +258,7 @@ class LiveTransport:
     (scan/connect + UDP TX socket + AF_PACKET RX). Untested offline."""
 
     # FRLG LDN identity (the same the bridge/console use).
-    LOCAL_COMMUNICATION_ID = 0x0100610011000000     # FireRed/LeafGreen gba-app title id
+    LOCAL_COMMUNICATION_ID = 0x0100610011000000     # FireRed/LeafGreen emulator title id
     SCENE_ID = 0
     APPLICATION_VERSION = 1
 
@@ -283,7 +283,7 @@ class LiveTransport:
         self.host_ip = None
         self.our_mac = None        # our 6-byte LDN MAC = our Pia connection GUID (constant id)
         self.host_mac = None       # the host's 6-byte LDN MAC = its Pia connection GUID
-        self.app_data = None       # the host's LDN advertisement beacon (gba-app RFU search data)
+        self.app_data = None       # the host's LDN advertisement beacon (emulator RFU search data)
         self.parent_pid = None     # parent RFU id extracted from the beacon (for the gba connect)
         self.iface = None
         self.broadcast = None
@@ -369,14 +369,14 @@ class LiveTransport:
                 self._ready.set()
                 return
             self.LOCAL_COMMUNICATION_ID = net.local_communication_id
-            # The advertisement's application data is the gba-app's RFU search beacon; the parent
-            # RFU id for our gba-app connect frame lives here (learned, never guessed).
+            # The advertisement's application data is the emulator's RFU search beacon; the parent
+            # RFU id for our emulator connect frame lives here (learned, never guessed).
             self.app_data = _dump_beacon(bytes(getattr(net, "application_data", b"") or b""),
                                          self.log)
             # The 30-byte gba payload is a Sloop-obfuscated RfuTgtData (parent discovery record).
             # idx 20-21 carries a 0x67xx value whose HIGH byte matches the reference capture's 'C' pid 0x6779
             # (same Switch, different session) - the session-varying parent RFU id. Extract it for the
-            # gba-app connect frame; the host's 'A' accept confirms it. (--parent-pid overrides.)
+            # emulator connect frame; the host's 'A' accept confirms it. (--parent-pid overrides.)
             if self.app_data and len(self.app_data) >= 0x5C + 22:
                 gba = self.app_data[0x5C:]
                 self.parent_pid = gba[20:22]
@@ -386,7 +386,7 @@ class LiveTransport:
             param = ldn.ConnectNetworkParam()
             param.keys = keys
             param.network = net
-            param.password = self.password           # 64-byte gba-app passphrase
+            param.password = self.password           # 64-byte emulator passphrase
             param.name = self.nickname.encode()
             param.app_version = self.APPLICATION_VERSION
             param.phyname = self.phyname              # wifi phy (like the bridge: phy0)
