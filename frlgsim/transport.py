@@ -345,7 +345,7 @@ class LiveTransport:
         async def main():
             keys = ldn.load_keys(self.keys_path)
             self.info("Scanning for the FRLG network...")
-            networks = await ldn.scan(keys)
+            networks = await ldn.scan(keys, phyname=self.phyname)
             joinable = [n for n in networks
                         if n.accept_policy != ldn.ACCEPT_NONE
                         and n.num_participants < n.max_participants]
