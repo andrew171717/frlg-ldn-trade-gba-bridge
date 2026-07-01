@@ -87,6 +87,8 @@ def _do_ldn_scan(phyname: str, keys_path: str) -> list[dict]:
                 "[SCAN] comm_id=0x%016x scene=%d %d/%d app_data=%d B",
                 comm_id, scene, num_p, max_p, len(app_raw),
             )
+            # Full hex dump -- lets us verify the offset and byte order.
+            log.info("[SCAN] app_raw: %s", app_raw.hex())
 
             # Extract GBA emulator payload from Pia beacon (0x5C-byte header).
             # Words 0-5 = 6 × u32 big-endian from the payload.
@@ -101,11 +103,19 @@ def _do_ldn_scan(phyname: str, keys_path: str) -> list[dict]:
             for i in range(6):
                 off = i * 4
                 if off + 4 <= len(gba_payload):
-                    words[i] = int.from_bytes(gba_payload[off:off + 4], "big")
+                    # The GBA is little-endian (ARM7); NSO stores each 32-bit
+                    # word in native LE byte order in the LDN app_data field.
+                    # Reading as little-endian recovers the original word value
+                    # so that the SPI TX FIFO sends it MSB-first and the GBA
+                    # receives exactly what the emulated FRLG game produced.
+                    words[i] = int.from_bytes(gba_payload[off:off + 4], "little")
                 else:
                     words[i] = 0x80000000  # filler if payload is shorter than expected
-            # words[6] = 0x00000000 (already 0)
+            # words[6]: slot index placeholder; overwritten with 1-based slot
+            # by the caller (_send_hosts) once we know which slot this host occupies.
 
+            log.info("[SCAN] -> gba_payload raw (%d B): %s",
+                     len(gba_payload), gba_payload.hex())
             log.info("[SCAN] -> words: %s", " ".join(f"0x{w:08x}" for w in words))
             results.append({"comm_id": comm_id, "words": words})
 
@@ -210,8 +220,8 @@ class ScanManager:
                     else:
                         self._hosts.append(entry)
 
-            # No sleep between scans -- the next ldn.scan() call itself provides
-            # natural back-pressure (~2-3 s).
+            # Wait 1 second before the next scan.
+            time.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +229,7 @@ class ScanManager:
 # ---------------------------------------------------------------------------
 
 def _send(port: serial.Serial, line: str) -> None:
-    data = (line + "\n").encode("ascii")
+    data = (line + "\n").encode("ascii", errors="replace")
     port.write(data)
     port.flush()
     log.debug("TX: %r", line)
@@ -228,10 +238,13 @@ def _send(port: serial.Serial, line: str) -> None:
 def _send_hosts(port: serial.Serial, hosts: list[dict]) -> None:
     """Send a HOSTS/HOST response block for the given host list."""
     _send(port, f"HOSTS {len(hosts)}")
-    for h in hosts:
-        words_str = " ".join(f"0x{w:08x}" for w in h["words"])
+    for slot, h in enumerate(hosts, start=1):
+        words = list(h["words"])
+        words[6] = slot   # real adapter uses 1-based slot index for word[6]
+        words_str = " ".join(f"0x{w:08x}" for w in words)
         _send(port, f"HOST {words_str}")
-        log.info("[RESULT] -> HOST comm_id=0x%016x: %s", h["comm_id"], words_str)
+        log.info("[RESULT] -> HOST slot=%d comm_id=0x%016x: %s",
+                 slot, h["comm_id"], words_str)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +265,12 @@ def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
 
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
-                line = raw.decode("ascii", errors="replace").strip()
+                # Strip to printable ASCII only -- the RP2040 UART can emit a
+                # couple of garbage bytes (\xff, \x00) at init before the first
+                # real command arrives.  Filtering here means "SCAN_START" is
+                # still recognised even if "\xff\x00" was prepended to it.
+                clean = bytes(b for b in raw if 0x20 <= b <= 0x7E)
+                line = clean.decode("ascii").strip()
                 if not line:
                     continue
 
