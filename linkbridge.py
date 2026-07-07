@@ -27,9 +27,14 @@ RP2040 -> Pi:  SCAN_START\\n      start scanning the LDN for FRLG lobby beacons
                SCAN_RESULT\\n     request current host list (instant reply)
                SCAN_STOP\\n       stop scanning and clear the cache
 
-Pi -> RP2040:  HOSTS <N>\\n       (only in response to SCAN_RESULT)
-               HOST <w0> ... <w6>\\n  (N lines; 7 LE u32 words, GBA 0x1D format)
-               ERR <msg>\\n       on unexpected errors
+Pi -> RP2040:  HOSTS <N>\\n              (only in response to SCAN_RESULT)
+               HOST <w0> ... <w6>\\n      (N lines; 7 LE u32 words, GBA 0x1D format)
+               ERR <msg>\\n              on unexpected errors
+               HOST_DATA <N> w0 ...\\n  N words; w0=LLSF byte count, w1..wN=Switch NI LLSF
+                                       bytes packed as u32 LE (NI_START→NI_END from the host).
+                                       rfu_STC_CHILD_analyzeRecvPacket reads w0 as
+                                       frames_remaining and w1.. as the NI sub-frame data.
+               DISCONNECT\\n            Switch rejected or cleanly disconnected
 
 HOST word layout — 7 plaintext words, GBA wireless adapter 0x1D BroadcastReadPoll format:
   w0 = id(u16) | slot(u8=0) | 0x00
@@ -72,6 +77,10 @@ import threading
 import time
 
 import serial  # pyserial
+
+from frlgsim.rfu_advert_map import decode_record, base85_encode, frlg_text
+from frlgsim.transport import LiveTransport
+from switch_session import SwitchSession
 
 log = logging.getLogger("linkbridge")
 
@@ -200,7 +209,7 @@ class ScanManager:
         try:
             import trio
             import ldn
-            from frlgsim.transport import free_radio
+            from frlgsim.transport import free_radio, _b85_decode
         except ImportError as e:
             log.error("[SCAN] missing dependency: %s — install requirements.txt", e)
             return
@@ -241,8 +250,26 @@ class ScanManager:
                     log.warning("[SCAN] app_data too short (%dB), skipping", len(app_raw))
                     continue
 
-                rfutgt = app_raw[RFU_TGT_DATA_OFFSET :
-                                 RFU_TGT_DATA_OFFSET + RFU_TGT_DATA_LEN]
+                # The RFU payload will be a custom base85-encoded blob.
+                gba_payload = app_raw[RFU_TGT_DATA_OFFSET:]
+                rfutgt = None
+                try:
+                    decoded = _b85_decode(gba_payload)
+                    # Log the decoded blob we received (may be shorter than expected)
+                    log.info("[SCAN] decoded (len=%d) %s", len(decoded), decoded.hex())
+                    if len(decoded) >= RFU_TGT_DATA_LEN:
+                        rfutgt = decoded[:RFU_TGT_DATA_LEN]
+                    else:
+                        # Accept shorter decoded payloads by padding with zeros to the
+                        # expected RFU_TGT_DATA_LEN so downstream code can consume it.
+                        rfutgt = decoded.ljust(RFU_TGT_DATA_LEN, b"\x00")
+                        log.info("[SCAN] decoded RFU payload shorter than %d; padded to %d bytes",
+                                 len(decoded), RFU_TGT_DATA_LEN)
+                    log.info("[SCAN] RFU raw (decoded) %s", rfutgt.hex())
+                except Exception:
+                    log.debug("[SCAN] RFU payload base85 decode failed; discarding", exc_info=True)
+                    log.info("[SCAN] skipping host comm_id=0x%016x: no valid RFU payload", comm_id)
+                    continue
 
                 results.append({
                     "comm_id":  comm_id,
@@ -270,6 +297,347 @@ class ScanManager:
 
 
 # ---------------------------------------------------------------------------
+# ConnectManager -- handles the GBA 0x1F Connect / 0x20 IsConnectionComplete
+# sequence on the Pi side.
+#
+# When the RP2040 sends "CONNECT 0x<rfu_id>", the Pi needs to:
+#   1. Stop the background LDN scan (the radio can't scan AND associate
+#      at the same time).
+#   2. Find the cached host whose rfu_id matches and get its comm_id.
+#   3. Join that LDN session via LiveTransport.start() -- this can take a
+#      few seconds.
+#   4. Report the result: "CONN_COMPLETE <clientNum> <our_id_hex>" on
+#      success, "CONN_FAILED <reason>" on failure.
+#
+# The RP2040 just polls 0x20 IsConnectionComplete in a tight GBA loop
+# (returning 0x01000000 while pending).  The reply arrives via the normal
+# bridge_poll_rx() drain, so no extra synchronisation is needed on the
+# RP2040 side.
+#
+# Thread safety: _lock protects all mutable state.
+# ---------------------------------------------------------------------------
+
+
+class ConnectManager:
+    """Manages a single async LDN join on behalf of the GBA's 0x1F command."""
+
+    IDLE     = "idle"
+    PENDING  = "pending"
+    COMPLETE = "complete"
+    FAILED   = "failed"
+
+    def __init__(self, phyname: str, keys_path: str) -> None:
+        self._phyname   = phyname
+        self._keys_path = keys_path
+        self._lock      = threading.Lock()
+        self._state     = self.IDLE
+        self._transport: LiveTransport | None = None
+        self._thread: threading.Thread | None = None
+        # Signals the Pia session loop (running in the _do_join thread after CONN_COMPLETE)
+        # to stop.  Set by reset(); cleared at the start of a new connect().
+        self._sim_stop  = threading.Event()
+        # Active SwitchSession (set during _run_pia, cleared on exit/reset).
+        # The main UART loop calls set_gba_data() on us, which routes here.
+        self._session: "SwitchSession | None" = None
+
+    # ------------------------------------------------------------------
+    # Called from the serial-I/O thread
+    # ------------------------------------------------------------------
+
+    def connect(self, rfu_id: int, broadcast_words: "list[int] | None",
+                scanner: "ScanManager", port: serial.Serial) -> None:
+        """Start an async LDN join for the host with the given rfu_id. 
+        Stops the background scanner (both compete for the radio), finds
+        the matching host in the scan cache, then spawns a thread that
+        calls LiveTransport.start() and writes the result back over
+        'port' when done.
+        broadcast_words: the 6 u32 words from the GBA's 0x16 Broadcast
+            (its own gname/uname identity).  Used as application_data in
+            the LDN ConnectNetworkParam so the host Switch sees our real
+            GBA trainer identity.  May be None if the GBA skipped 0x16.
+        """
+        with self._lock:
+            if self._state == self.PENDING:
+                log.warning("[CONN] connect() called while already pending -- ignoring")
+                return
+            # Tear down any previous transport and stop any running Pia loop.
+            self._sim_stop.set()
+            self._teardown_locked()
+            self._sim_stop.clear()   # arm for the new session
+            self._state = self.PENDING
+
+        # Snapshot the host list BEFORE stopping the scanner --
+        # stop() calls _hosts.clear(), so doing this after would always
+        # give an empty list and comm_id would be None every time.
+        hosts = scanner.get_hosts()
+
+        # Now stop the scanner so the radio is free for the LDN join.
+        scanner.stop()
+
+        # Find the comm_id matching this rfu_id in the cached host list.
+        comm_id = None
+        for h in hosts:
+            try:
+                r = decode_record(h["rfutgt"])
+                if r["rfu_id"] == rfu_id:
+                    comm_id = h["comm_id"]
+                    break
+            except Exception:
+                pass
+
+        if comm_id is None:
+            log.warning("[CONN] rfu_id=0x%04x not found in cache (%d hosts); "
+                        "joining any available FRLG network", rfu_id, len(hosts))
+
+        # Build application_data from the GBA's broadcast identity.
+        # Also keep the raw rfutgt record to extract trainer name/TID for the
+        # NI game-data handshake (so the Switch sees the real GBA trainer).
+        rfutgt:   "bytes | None" = None
+        app_data: "bytes | None" = None
+        if broadcast_words and len(broadcast_words) == 6:
+            try:
+                rfutgt = _broadcast_words_to_rfutgt(rfu_id, broadcast_words)
+                # base85_encode produces 30 bytes (24-byte record -> 30 chars).
+                # The ldn lib prepends the Pia system header itself; we supply
+                # only the 30-byte game payload.
+                app_data = base85_encode(rfutgt)
+                log.info("[CONN] built application_data (%d bytes) from broadcast: %s",
+                         len(app_data), app_data.hex())
+            except Exception as e:
+                log.warning("[CONN] could not build application_data: %s", e)
+
+        log.info("[CONN] starting LDN join for rfu_id=0x%04x comm_id=%s",
+                 rfu_id, f"0x{comm_id:016x}" if comm_id is not None else "any")
+
+        t = threading.Thread(
+            target=self._do_join,
+            args=(rfu_id, comm_id, app_data, rfutgt, port),
+            daemon=True,
+            name="ldn-join",
+        )
+        with self._lock:
+            self._thread = t
+        t.start()
+
+    def set_gba_data(self, words: list) -> None:
+        """Route GBA_DATA from the UART loop to the active SwitchSession.
+
+        Called from the main serial-I/O thread each time the RP2040 sends a
+        GBA_DATA line (i.e. each 0x24/0x25 SendData command from the GBA).
+        `words` are u32 hex values straight from the UART line; set_gba_words()
+        handles the u32→u16 unpacking internally.
+        """
+        s = self._session
+        if s is not None:
+            s.set_gba_words(words)
+
+    def reset(self) -> None:
+        """Tear down any active join/session loop and return to IDLE.  Called on adapter reset."""
+        self._sim_stop.set()   # signal the session loop to exit (outside the lock is fine for Event)
+        with self._lock:
+            self._teardown_locked()
+            self._state = self.IDLE
+        log.info("[CONN] reset")
+
+    # ------------------------------------------------------------------
+    # Background join thread
+    # ------------------------------------------------------------------
+
+    def _do_join(self, rfu_id: int, comm_id: "int | None",
+                app_data: "bytes | None", rfutgt: "bytes | None",
+                port: serial.Serial) -> None:
+        # Phase 1: LDN join.  Failure here sends CONN_FAILED.
+        try:
+            transport = LiveTransport(
+                keys_path=self._keys_path,
+                phyname=self._phyname,
+                ifname="ldnclient",
+                local_comm_id=comm_id,       # None → LiveTransport picks first FRLG match
+                application_data=app_data,   # GBA trainer identity for the LDN join
+                log=log.debug,
+            )
+            transport.start(timeout=30, attempts=3)
+
+            # Derive a 16-bit client ID from our LDN MAC (bytes 4-5, big-endian).
+            # The GBA's librfu uses this as our adapter identity for the session.
+            our_mac  = transport.our_mac or b"\x00\x00\x00\x00\x00\x01"
+            our_id   = (our_mac[4] << 8 | our_mac[5]) & 0xFFFF or 0x0001
+            # clientNum: GBA wireless adapter slot numbers are 1-based.  The
+            # first (and only) child in a 2-player FRLG trade is slot 1.
+            # The 0x20 IsConnectionComplete response is (clientNum << 16) | our_id;
+            # the GBA's librfu checks bits 23-16 (the slot byte) to determine
+            # whether the connection is complete -- a zero slot byte means "not
+            # yet connected", even if our_id is non-zero.
+            client_num = 1
+
+            with self._lock:
+                self._transport = transport
+                self._state     = self.COMPLETE
+
+            log.info("[CONN] join SUCCESS rfu_id=0x%04x our_id=0x%04x clientNum=%d",
+                     rfu_id, our_id, client_num)
+            _send(port, f"CONN_COMPLETE {client_num} 0x{our_id:04x}")
+
+        except Exception as e:
+            reason = str(e).splitlines()[0][:80]
+            with self._lock:
+                self._state = self.FAILED
+            log.error("[CONN] join FAILED rfu_id=0x%04x: %s", rfu_id, reason)
+            _send(port, f"CONN_FAILED {reason}")
+            return   # do not proceed to Pia
+
+        # Phase 2: Pia S0 connection layer + data relay.
+        # IMPORTANT: this runs OUTSIDE the try/except above.  Any exception here
+        # must NOT send CONN_FAILED -- the RP2040 already received CONN_COMPLETE
+        # and told the GBA the connection succeeded.  Sending CONN_FAILED now would
+        # corrupt the RP2040 state machine (state flips COMPLETE → FAILED, causing
+        # 0x21 to return 0x00000000 and the GBA to time out).
+        try:
+            self._run_pia(transport, port, rfutgt, client_num)
+        except Exception as exc:
+            log.error("[CONN] Pia S0 unexpected error (CONN_COMPLETE already sent): %s", exc)
+
+    def _run_pia(self, transport: LiveTransport,
+                port: serial.Serial, rfutgt: "bytes | None",
+                client_num: int = 1) -> None:
+        """Run the Pia S0 connection layer + UNI data relay loop via SwitchSession.
+
+        - Net 0x11→0x12: Switch recognises us as a Pia peer.
+        - Session join: Switch registers us as a participant.
+        - RTT keepalive: keeps the session alive.
+        - NI handshake: game-data exchange; once complete the Switch confirms
+          JOIN_GROUP_OK — we forward JOIN_OK to the RP2040.
+        - UNI: each non-idle host slot is packed and sent as HOST_DATA.
+
+        Ticks at ~60 Hz until _sim_stop is set (by reset()).
+        """
+        import os as _os
+        try:
+            from frlgsim import crypto as cryptomod, pia_connect, linkplayer
+        except ImportError as e:
+            log.error("[CONN] Pia S0: missing dependency: %s — sync frlgsim to the Pi", e)
+            return
+
+        if not transport.ssid:
+            log.error("[CONN] Pia S0: transport has no SSID; cannot initialise crypto")
+            return
+
+        # Build a LinkPlayer from the GBA's rfutgt record so the NI game-data
+        # sub-frame carries the real trainer name and TID (not the "EMU" defaults).
+        lp = linkplayer.LinkPlayer()    # defaults: name="EMU", version=LeafGreen
+        if rfutgt is not None:
+            try:
+                r       = decode_record(rfutgt)
+                name    = frlg_text(r["uname_bytes"]) or "GBA"
+                tid     = r["player_tid"] & 0xFFFF
+                # version field is only 3 bits in the rfutgt record; map to LP constant.
+                ver_raw = r.get("version", 4) & 0x07
+                if ver_raw == 5:
+                    version = linkplayer.VERSION_LEAF_GREEN   # 0x4005
+                else:
+                    version = linkplayer.VERSION_FIRE_RED     # 0x4004 (default)
+                lp = linkplayer.LinkPlayer(name=name, trainer_id=tid, version=version)
+                log.info("[CONN] Pia NI: using GBA trainer %r TID=0x%04x version=0x%04x",
+                         name, tid, version)
+            except Exception as exc:
+                log.warning("[CONN] Pia NI: could not decode rfutgt: %s — using defaults", exc)
+
+        pc   = cryptomod.PiaCrypto(transport.ssid)
+        conn = pia_connect.ConnectionManager(
+            our_mac     = transport.our_mac  or b"\x00" * 6,
+            host_mac    = transport.host_mac or b"\x00" * 6,
+            our_ip      = transport.our_ip,
+            host_ip     = transport.host_ip,
+            player_name = lp.name,
+            random4     = _os.urandom(4),
+            log         = log.debug,
+        )
+        # Random nonzero 2-byte RFU connect id ('C' frame).  Any nonzero value
+        # works; a fresh id per run avoids the host's ~40 s lost-id re-join lockout.
+        raw_id     = int.from_bytes(_os.urandom(2), "big") or 1
+        connect_id = raw_id.to_bytes(2, "big")
+
+        session = SwitchSession(
+            transport, pc, transport.our_ip, transport.host_ip,
+            conn=conn, connect_id=connect_id, lp=lp, log=log.debug,
+        )
+        session.set_client_num(client_num)
+
+        with self._lock:
+            self._session = session
+
+        period        = 1.0 / 59.727
+        announced     = False
+        join_notified = False
+        log.info("[CONN] Pia S0: starting (Net 0x11 → Session join → NI handshake)...")
+
+        try:
+            while not self._sim_stop.is_set():
+                try:
+                    session.tick()
+                except Exception as exc:
+                    log.error("[CONN] Pia S0: tick() error: %s", exc)
+                    break
+
+                if session.connected and not announced:
+                    announced = True
+                    log.info("[CONN] Pia S0: CONNECTED — Switch should now show the join prompt")
+
+                # NI join status: forward JOIN_OK (or disconnect on rejection) once.
+                # join_status_pending fires only after ni_recv.complete (NI_END received),
+                # so host_ni_bytes contains the full NI_START→NI_END LLSF byte sequence.
+                if not join_notified and session.join_status_pending:
+                    status = session.consume_join_status()
+                    join_notified = True
+                    if status == SwitchSession.JOIN_GROUP_OK:
+                        # Pack the Switch's raw NI LLSF bytes into HOST_DATA words:
+                        #   w0 = total byte count (for resp_data[0] → rfu frames_remaining)
+                        #   w1..wN = bytes packed as u32 LE (resp_data[1..] → LLSF frame bytes)
+                        ni_bytes = session.host_ni_bytes
+                        byte_count = len(ni_bytes)
+                        words = [byte_count]
+                        for i in range(0, byte_count, 4):
+                            chunk = ni_bytes[i:i + 4].ljust(4, b"\x00")
+                            words.append(int.from_bytes(chunk, "little"))
+                        word_hex = " ".join(f"0x{w:08X}" for w in words)
+                        log.info("[CONN] Switch JOIN_GROUP_OK — sending HOST_DATA %d %s to RP2040"
+                                 " (%d LLSF bytes)", len(words), word_hex, byte_count)
+                        _send(port, f"HOST_DATA {len(words)} {word_hex}")
+                    else:
+                        log.warning("[CONN] Switch join rejected (status=%d) — disconnecting", status)
+                        _send(port, "DISCONNECT")
+                        break
+
+                # Drain frames each tick to prevent the queue from growing,
+                # but do not forward them — host data is handled manually.
+                session.drain_host_slots()
+
+                # Clean disconnect signals.
+                if session.ni_rejected or session.host_disconnected:
+                    _send(port, "DISCONNECT")
+                    break
+
+                time.sleep(period)
+        finally:
+            with self._lock:
+                if self._session is session:
+                    self._session = None
+            log.info("[CONN] Pia S0: loop exited")
+
+    # ------------------------------------------------------------------
+    # Internal helpers (call with _lock held)
+    # ------------------------------------------------------------------
+
+    def _teardown_locked(self) -> None:
+        """Stop any active LiveTransport.  Must be called with self._lock held."""
+        self._session = None         # drop SwitchSession reference
+        t = self._transport
+        self._transport = None
+        if t is not None:
+            threading.Thread(target=t.stop, daemon=True, name="ldn-stop").start()
+
+
+# ---------------------------------------------------------------------------
 # Serial I/O helpers
 # ---------------------------------------------------------------------------
 
@@ -280,37 +648,111 @@ def _send(port: serial.Serial, line: str) -> None:
     log.debug("TX: %r", line)
 
 
-def _rfutgt_to_words(rfutgt: bytes) -> list:
-    """Convert a 30-byte RfuTgtData struct (from the LDN beacon) to 7 LE u32 words
+def _broadcast_words_to_rfutgt(rfu_id: int, words: list[int]) -> bytes:
+    """Reconstruct a 24-byte RFU beacon record from the 6 words the GBA sent
+    in its 0x16 Broadcast command (w1-w6 of the BroadcastReadPoll format).
+
+    The GBA's 0x16 Broadcast carries its own game identity without the metadata
+    word (w0).  The layout of the 6 words (all LE u32):
+
+      words[0]  =  serialNo(u16) | gname[0] | gname[1]
+      words[1]  =  gname[2..5]
+      words[2]  =  gname[6..9]
+      words[3]  =  gname[10] | gname[11] | gname[12] | ~checksum
+      words[4]  =  uname[0..3]
+      words[5]  =  uname[4..7]
+
+    We rebuild the 24-byte record used by rfu_advert_map.decode_record():
+
+      [0x00:0x02]  player_tid    → gname[2:4]  (TID lives in gname bytes 2-3)
+      [0x02:0x0A]  uname_bytes   → uname[0:8]
+      [0x0A:0x0C]  rfu_id        → the host's rfu_id from the 0x1F Connect word
+                                    (the field means "parent id child connects to")
+      [0x0C:0x10]  partner_info  → gname[4:8]
+      [0x10:0x14]  packed_game   → reconstructed from gname[0:2] (compat u16) +
+                                    gname[8:12] fields
+      [0x14:0x18]  trade_species → gname[8:10] packed word (species at bits 16-25)
+    """
+    # Unpack the 6 words into their constituent bytes (little-endian).
+    raw = bytearray()
+    for w in words:
+        raw += w.to_bytes(4, "little")
+    # raw[0:2]  = serialNo  (not stored in the 24-byte record)
+    # raw[2:4]  = gname[0:2]  (compat u16)
+    # raw[4:8]  = gname[2:6]
+    # raw[8:12] = gname[6:10]
+    # raw[12:15]= gname[10:13]
+    # raw[15]   = ~checksum  (not needed for the record)
+    # raw[16:20]= uname[0:4]
+    # raw[20:24]= uname[4:8]
+    gname  = bytes(raw[2:15])    # 13 bytes: raw[2] = gname[0] ... raw[14] = gname[12]
+    uname  = bytes(raw[16:24])   # 8 bytes
+
+    # 24-byte record layout (rfu_advert_map.py):
+    #   [0x00:0x02] player_tid   = gname[2:4] (LE u16)
+    #   [0x02:0x0A] uname_bytes  = uname[0:8]
+    #   [0x0A:0x0C] rfu_id       = host rfu_id (LE u16)
+    #   [0x0C:0x10] partner_info = gname[4:8]
+    #   [0x10:0x14] packed_game  = reconstruct from gname[0:2] compat + gname[8:13]
+    #   [0x14:0x18] trade_species_word = gname[8:12] repacked at bit 16
+    record = bytearray(24)
+    record[0x00:0x02] = gname[2:4]          # player_tid
+    record[0x02:0x0A] = uname               # uname_bytes
+    record[0x0A:0x0C] = rfu_id.to_bytes(2, "little")   # rfu_id (= host id)
+    record[0x0C:0x10] = gname[4:8]          # partner_info
+    # packed_game: copy the compat u16 (gname[0:2]) and the packed activity/
+    # gender/version/etc. fields (gname[8:12]).  We don't have the full bitfield
+    # expansion here; store what we have and let the host decode it.
+    record[0x10:0x12] = gname[0:2]          # compat u16 (activity, version, language …)
+    record[0x12:0x14] = gname[8:10]         # packed activity / tradeType bits
+    record[0x14:0x18] = gname[8:12]         # trade_species_word
+    return bytes(record)
+
+
+def _rfutgt_to_words(record: bytes) -> list:
+    """Convert a decoded RFU beacon record (24 bytes) to 7 LE u32 words
     in the GBA wireless adapter 0x1D BroadcastReadPoll per-host format (28 bytes).
 
-    RfuTgtData layout (librfu.h):
-      [0:2]  id (u16 LE)      — host RFU id; passed through to the GBA child
-      [2]    slot             — passed through
-      [3]    mbootFlag        — ZEROED (must be 0 in the 0x1D response)
-      [4:6]  serialNo         — 0x0002 for FRLG; passed through
-      [6:19] gname[0:13]      — plaintext RfuGameData struct
-      [19]   gname[13]        — ~checksum; already valid, computed by host GBA
-      [20]   gname[14]        — 0x00 PADDING; SKIPPED in the 0x1D format
-      [21:30] uname[0:9]      — GBA charmap trainer name; first 8 bytes used
+    Field extraction is delegated to rfu_advert_map.decode_record(). See that
+    module for the full beacon record layout and field descriptions.
 
-    The 0x1D format is 28 bytes; uname starts at byte 20, immediately after the
-    checksum — so rfutgt[20] (gname[14] padding) must be skipped and uname taken
-    from rfutgt[21:29].
-
-    The checksum at rfutgt[19] was computed by the host GBA as:
-      ~(sum(gname[0:8]) + sum(uname[0:8])) & 0xFF
-    It is already correct for the received gname and uname bytes — we pass it
-    through unchanged. No re-computation needed.
+    Fields not carried in the beacon (slot, mbootFlag) are zeroed.
+    serialNo is hardcoded 0x0002 (FRLG).
+    The gname checksum is computed: ~(sum(gname[0:8]) + sum(uname[0:8])) & 0xFF.
     """
-    assert len(rfutgt) >= 30, f"RfuTgtData too short: {len(rfutgt)}"
+    r = decode_record(record)
+
+    uname = r["uname_bytes"]   # 8 GBA charmap bytes from record[0x02:0x0A]
+
+    # Reconstruct compat u16 (GBA layout: language[0:4] | flags[4:10] | version[10:14])
+    compat = ((r["language"]          & 0x0F)       |
+              ((r["canLinkNationally"] & 0x01) << 7) |
+              ((r["hasNationalDex"]    & 0x01) << 8) |
+              ((r["gameClear"]         & 0x01) << 9) |
+              ((r["version"]           & 0x0F) << 10))
+
+    # Build gname (13 bytes, RfuGameData layout per ni.py / build_game_data)
+    rgd = bytearray(13)
+    rgd[0:2]  = (compat & 0xFFFF).to_bytes(2, "little")
+    rgd[2:4]  = r["player_tid"].to_bytes(2, "little")
+    rgd[4:8]  = r["partner_info"]
+    rgd[8:10] = ((r["trade_species"] & 0x3FF) | ((r["tradeType"] & 0x3F) << 10)).to_bytes(2, "little")
+    rgd[10]   = (r["activity"] & 0x7F) | ((r["startedActivity"] & 0x01) << 7)
+    rgd[11]   = (r["playerGender"] & 0x01) | ((r["tradeLevel"] & 0x7F) << 1)
+    rgd[12]   = 0
+
+    checksum = (~(sum(rgd[0:8]) + sum(uname)) & 0xFF)
+
+    # Assemble 28-byte 0x1D packet
     pkt = bytearray(28)
-    pkt[0:2]   = rfutgt[0:2]    # id
-    pkt[2]     = rfutgt[2]      # slot
-    pkt[3]     = 0              # mbootFlag → 0
-    pkt[4:6]   = rfutgt[4:6]   # serialNo
-    pkt[6:20]  = rfutgt[6:20]  # gname[0:13] + checksum (bytes 6-19 of RfuTgtData)
-    pkt[20:28] = rfutgt[21:29] # uname[0:8] — skip rfutgt[20] (gname[14] padding)
+    pkt[0:2]   = r["rfu_id"].to_bytes(2, "little")
+    pkt[2]     = 0              # slot (not carried)
+    pkt[3]     = 0              # mbootFlag = 0
+    pkt[4:6]   = b'\x02\x00'   # serialNo = 0x0002 (FRLG)
+    pkt[6:19]  = rgd
+    pkt[19]    = checksum
+    pkt[20:28] = uname
+
     return [int.from_bytes(pkt[i * 4 : i * 4 + 4], "little") for i in range(7)]
 
 
@@ -334,7 +776,8 @@ def _send_hosts(port: serial.Serial, hosts: list) -> None:
 # ---------------------------------------------------------------------------
 
 def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
-    scanner = ScanManager(phyname, keys_path)
+    scanner   = ScanManager(phyname, keys_path)
+    connector = ConnectManager(phyname, keys_path)
 
     log.info("Opening %s at %d baud", port_path, baud)
     with serial.Serial(port_path, baud, timeout=0.1) as port:
@@ -360,6 +803,9 @@ def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
                 cmd = line.upper()
 
                 if cmd == "SCAN_START":
+                    # A new GBA session is starting -- tear down any leftover
+                    # LDN connection from a previous session before scanning.
+                    connector.reset()
                     scanner.start()
 
                 elif cmd == "SCAN_RESULT":
@@ -372,6 +818,38 @@ def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
 
                 elif cmd == "SCAN_STOP":
                     scanner.stop()
+
+                elif line.upper().startswith("GBA_DATA "):
+                    # "GBA_DATA N 0x<w0> 0x<w1> ..."
+                    # GBA's 0x24/0x25 slot payload from the RP2040.  Route to the
+                    # active relay engine so it can be forwarded to the Switch via
+                    # Sim.tick() on the next Pia VBlank.
+                    parts = line.split()
+                    try:
+                        count = int(parts[1], 10)
+                        words = [int(w, 16) for w in parts[2 : 2 + count]]
+                        connector.set_gba_data(words)
+                    except (IndexError, ValueError):
+                        log.warning("[RELAY] malformed GBA_DATA: %r", line)
+
+                elif line.upper().startswith("CONNECT "):
+                    # "CONNECT 0x<rfu_id> [w0 w1 w2 w3 w4 w5]"
+                    # The 6 optional words are the GBA's 0x16 Broadcast identity
+                    # (its own gname/uname) forwarded by the RP2040.
+                    parts = line.split()
+                    try:
+                        rfu_id = int(parts[1], 16)
+                    except (IndexError, ValueError):
+                        log.warning("[CONN] malformed CONNECT line: %r", line)
+                        _send(port, "CONN_FAILED bad rfu_id")
+                    else:
+                        broadcast_words = None
+                        if len(parts) >= 8:
+                            try:
+                                broadcast_words = [int(w, 16) for w in parts[2:8]]
+                            except ValueError:
+                                log.warning("[CONN] malformed broadcast words in CONNECT: %r", line)
+                        connector.connect(rfu_id, broadcast_words, scanner, port)
 
                 else:
                     log.warning("Unknown command: %r", line)
