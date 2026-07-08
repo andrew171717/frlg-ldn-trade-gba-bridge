@@ -117,8 +117,8 @@ class _PassthroughEngine:
         # Accumulated PARENT LLSF bytes from the Switch's host NI sub-frames.
         # Built here (not in Sim) so the accumulation stays bridge-specific.
         # Exposed via SwitchSession.host_ni_bytes for linkbridge.py → HOST_DATA.
-        self._host_ni_frames     = bytearray()
-        self._host_ni_start_seen = False  # de-dup: keep only the first NI_START
+        self._host_ni_frames = bytearray()
+        self._host_ni_seen:  set = set()  # de-dup keys: state for NI_START, (state,n) for others
         # GBA child slot number (1-based, from CONN_COMPLETE).  Used to set
         # bmSlot in the reconstructed PARENT LLSF header (bmSlot = 1 << (client_num-1)).
         self._client_num: int = 1        # default: first (and only) child
@@ -160,12 +160,12 @@ class _PassthroughEngine:
                 bm_slot   = 1 << (self._client_num - 1)
                 llsf_int  = (state << 14) | (bm_slot << 18) | (ni["n"] << 11) | (ni["phase"] << 9) | ni["size"]
                 slot_b    = llsf_int.to_bytes(3, "little") + bytes(ni["payload"])[:ni["size"]]
+                # NI_START retransmits increment n — de-dup by state alone.
+                # NI/NI_END retransmits reuse the same n — de-dup by (state, n).
+                key = state if state == _LCOM_NI_START else (state, ni["n"])
                 with self._lock:
-                    if state == _LCOM_NI_START:
-                        if not self._host_ni_start_seen:
-                            self._host_ni_frames.extend(slot_b)
-                            self._host_ni_start_seen = True
-                    else:
+                    if key not in self._host_ni_seen:
+                        self._host_ni_seen.add(key)
                         self._host_ni_frames.extend(slot_b)
         with self._lock:
             self._incoming.append(rec)
@@ -315,7 +315,7 @@ class SwitchSession:
         slots = []
         for frame in self.drain_frames():
             for mpid, slot_bytes in (frame.get("positional") or []):
-                if mpid == 0 and len(slot_bytes) >= 14 and any(slot_bytes):
+                if mpid == 0 and len(slot_bytes) >= 14:
                     slots.append(bytes(slot_bytes[:14]))
         return slots
 
@@ -410,7 +410,7 @@ class SwitchSession:
     def _poll_join_status(self) -> None:
         """Check if the Switch's NI join status has arrived; fire pending flag once.
 
-        Waits for ni_recv.complete (NI_END received) so that _sim._host_ni_frames
+        Waits for ni_recv.complete (NI_END received) so that _engine._host_ni_frames
         contains the full NI byte sequence before linkbridge.py reads host_ni_bytes.
         """
         if self._join_status_raw is not None:
@@ -422,4 +422,4 @@ class SwitchSession:
             self._join_status_pending = True
             label = "JOIN_GROUP_OK" if st == JOIN_GROUP_OK else f"REJECTED (status={st})"
             self.log(f"[switch_session] host NI join status = {label} "
-                     f"({len(self._sim._host_ni_frames)} LLSF bytes collected)")
+                     f"({len(self._engine._host_ni_frames)} LLSF bytes collected)")
