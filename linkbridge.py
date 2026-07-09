@@ -355,6 +355,7 @@ class ConnectManager:
         # _parent_ni_raw_frames[state] = raw LLSF bytes for that parent NI sub-frame.
         # _pia_port is set while _run_pia runs so set_gba_data() can send HOST_DATA.
         self._in_ni_handshake:     bool                    = False
+        self._ni_b_expect:         int                     = 0   # 0=inactive, 1-3=next state Phase B expects
         self._client_num_cached:   int                     = 1
         self._pia_port:            "serial.Serial | None"  = None
         self._parent_ni_raw_frames: "dict[int, bytes]"     = {}
@@ -467,30 +468,42 @@ class ConnectManager:
         phase = (child_llsf >> 5)  & 3
 
         if ack == 0 and 1 <= state <= 3:
-            # GBA's NISender sub-frame (ack=0): queue ONE PARENT LLSF ACK so the
-            # GBA's NISender can advance (NI_START→NI→NI_END).  The parent NI sub-
-            # frames were already delivered in the initial burst at JOIN_GROUP_OK, so
-            # we only need to send ACKs here — one message per READY keeps the queue
-            # from growing faster than it drains.
+            # Phase A — GBA's NISender (ack=0).
+            # Send ONE combined HOST_DATA: [PARENT LLSF ACK (3 bytes)] + [parent NI
+            # sub-frame for this state (from _parent_ni_raw_frames)].  This matches
+            # the real wireless adapter which coalesces both into a single 0x26 reply.
+            # rfu_STC_CHILD_analyzeRecvPacket then sees:
+            #   ack=1 LLSF → NISender advances to next state
+            #   ack=0 LLSF + payload → NIReceiver ingests the parent NI sub-frame
             bm_slot = 1 << (self._client_num_cached - 1)
             parent_ack_int = (state << 14) | (bm_slot << 18) | (1 << 13) | (n << 11) | (phase << 9)
             ack_bytes = parent_ack_int.to_bytes(3, "little")
-            ack_words = [len(ack_bytes), int.from_bytes(ack_bytes + b"\x00", "little")]
-            ack_msg = "HOST_DATA {} {}".format(
-                len(ack_words), " ".join(f"0x{w:08X}" for w in ack_words))
-            log.info("[NI-ACK] GBA state=%d n=%d ph=%d → %s", state, n, phase, ack_msg)
-            self._enqueue_host_data(ack_msg, port)
-            if state == 3:
-                self._in_ni_handshake = False
-                log.info("[NI-ACK] NI handshake complete")
+            ni_frm = self._parent_ni_raw_frames.get(state, b"")
+            combined = ack_bytes + ni_frm
+            combined_words = [len(combined)]
+            for i in range(0, len(combined), 4):
+                combined_words.append(int.from_bytes(
+                    combined[i:i + 4].ljust(4, b"\x00"), "little"))
+            combined_msg = "HOST_DATA {} {}".format(
+                len(combined_words), " ".join(f"0x{w:08X}" for w in combined_words))
+            log.info("[NI-A] GBA state=%d n=%d ph=%d → %s", state, n, phase, combined_msg)
+            self._enqueue_host_data(combined_msg, port)
+            # Track how far Phase A has sent so Phase B knows when to clear.
+            if state > self._ni_b_expect:
+                self._ni_b_expect = state
+
+        elif ack == 1 and state == 3 and self._ni_b_expect >= 3:
+            # Phase B — GBA's NIReceiver confirmed the last parent NI sub-frame
+            # (NI_END, state=3).  Phase A already delivered all 3 sub-frames combined
+            # with their ACKs, so we have nothing to send here.  Clear the handshake
+            # flag so UNI can flow.
+            self._in_ni_handshake = False
+            self._ni_b_expect = 0
+            log.info("[NI-B] GBA NIReceiver ACKed NI_END — NI complete, UNI can start")
 
         elif ack == 1 and 1 <= state <= 3:
-            # GBA's NIReceiver ACK (ack=1) — no response needed; parent NI data was
-            # already delivered in the combined message above.
-            log.debug("[NI-B] GBA NIReceiver ACKed parent state=%d", state)
-            if state == 3:
-                self._in_ni_handshake = False
-                log.info("[NI-B] GBA NIReceiver ACKed NI_END — NI fully complete")
+            log.debug("[NI-B] GBA ack=1 state=%d (ni_b_expect=%d) — no action",
+                      state, self._ni_b_expect)
 
     def on_ready(self, port: serial.Serial) -> None:
         """Called when RP2040 sends READY — dequeue and send one HOST_DATA.
@@ -530,6 +543,7 @@ class ConnectManager:
             self._hd_queue        = queue.SimpleQueue()
             self._hd_ready_pending = False
         self._in_ni_handshake      = False
+        self._ni_b_expect          = 0
         self._pia_port             = None
         self._parent_ni_raw_frames = {}
         log.info("[CONN] reset")
@@ -685,22 +699,25 @@ class ConnectManager:
                     status = session.consume_join_status()
                     join_notified = True
                     if status == SwitchSession.JOIN_GROUP_OK:
-                        # Send all 3 parent NI sub-frames in one initial HOST_DATA
-                        # burst so the GBA's NIReceiver immediately gets JOIN_GROUP_OK
-                        # (state=2 payload=5).  After this, set_gba_data() sends one
-                        # PARENT LLSF ACK per GBA NI round — 1 message per READY so
-                        # the queue never grows faster than it drains.
+                        # Parse individual sub-frames for Phase B (NIReceiver ACK
+                        # cycle): when GBA ACKs state S we send raw frame S+1.
                         ni_bytes = session.host_ni_bytes
-                        byte_count = len(ni_bytes)
-                        words_all = [byte_count]
-                        for i in range(0, byte_count, 4):
-                            words_all.append(int.from_bytes(
-                                ni_bytes[i:i + 4].ljust(4, b"\x00"), "little"))
-                        word_hex = " ".join(f"0x{w:08X}" for w in words_all)
-                        burst_msg = f"HOST_DATA {len(words_all)} {word_hex}"
-                        log.info("[CONN] Switch JOIN_GROUP_OK — queuing initial NI burst: %s",
-                                 burst_msg)
-                        self._enqueue_host_data(burst_msg, port)
+                        raw_frames: "dict[int, bytes]" = {}
+                        off = 0
+                        while off + 3 <= len(ni_bytes):
+                            hdr       = int.from_bytes(ni_bytes[off:off + 3], "little")
+                            frm_state = (hdr >> 14) & 0xF
+                            frm_size  = hdr & 0x7F
+                            raw_frames[frm_state] = bytes(ni_bytes[off:off + 3 + frm_size])
+                            off += 3 + frm_size
+                        self._parent_ni_raw_frames = raw_frames
+                        log.info("[CONN] Switch JOIN_GROUP_OK — parsed %d parent NI raw frames: %s",
+                                 len(raw_frames),
+                                 {s: f.hex() for s, f in raw_frames.items()})
+                        # No initial burst.  Phase A delivers each parent NI sub-frame
+                        # combined with the PARENT LLSF ACK for that state (one per
+                        # GBA NISender round).  This matches the real wireless adapter
+                        # which always coalesces ACK + NI sub-frame in one 0x26 response.
                         self._client_num_cached = client_num
                         self._in_ni_handshake   = True
                     else:
