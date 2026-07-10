@@ -356,7 +356,7 @@ class ConnectManager:
         # _pia_port is set while _run_pia runs so set_gba_data() can send HOST_DATA.
         self._in_ni_handshake:     bool                    = False
         self._ni_b_expect:         int                     = 0   # 0=inactive, 1-3=next state Phase B expects
-        self._client_num_cached:   int                     = 1
+        self._client_num_cached:   int                     = 0
         self._pia_port:            "serial.Serial | None"  = None
         self._parent_ni_raw_frames: "dict[int, bytes]"     = {}
 
@@ -456,6 +456,8 @@ class ConnectManager:
         """
         s = self._session
         if s is not None:
+            # word[0] is the GBA's slot identifier (0x900=slot0, 0x12000=slot1);
+            # it is part of the slot data the Switch needs and must not be stripped.
             s.set_gba_words(words)
 
         port = self._pia_port
@@ -475,7 +477,7 @@ class ConnectManager:
             # rfu_STC_CHILD_analyzeRecvPacket then sees:
             #   ack=1 LLSF → NISender advances to next state
             #   ack=0 LLSF + payload → NIReceiver ingests the parent NI sub-frame
-            bm_slot = 1 << (self._client_num_cached - 1)
+            bm_slot = 1 << self._client_num_cached
             parent_ack_int = (state << 14) | (bm_slot << 18) | (1 << 13) | (n << 11) | (phase << 9)
             ack_bytes = parent_ack_int.to_bytes(3, "little")
             ni_frm = self._parent_ni_raw_frames.get(state, b"")
@@ -488,22 +490,45 @@ class ConnectManager:
                 len(combined_words), " ".join(f"0x{w:08X}" for w in combined_words))
             log.info("[NI-A] GBA state=%d n=%d ph=%d → %s", state, n, phase, combined_msg)
             self._enqueue_host_data(combined_msg, port)
-            # Track how far Phase A has sent so Phase B knows when to clear.
-            if state > self._ni_b_expect:
-                self._ni_b_expect = state
-
-        elif ack == 1 and state == 3 and self._ni_b_expect >= 3:
-            # Phase B — GBA's NIReceiver confirmed the last parent NI sub-frame
-            # (NI_END, state=3).  Phase A already delivered all 3 sub-frames combined
-            # with their ACKs, so we have nothing to send here.  Clear the handshake
-            # flag so UNI can flow.
-            self._in_ni_handshake = False
-            self._ni_b_expect = 0
-            log.info("[NI-B] GBA NIReceiver ACKed NI_END — NI complete, UNI can start")
+            # After delivering NI_START (state=1) to the GBA's NIReceiver, arm
+            # Phase B to deliver state=2 once the GBA ACKs state=1.  NIReceiver
+            # ignores sub-frames that arrive in later NISender rounds; it only
+            # processes each sub-frame in response to its own sequential ACKs.
+            if state == 1:
+                self._ni_b_expect = 2   # next to deliver: parent NI state=2
 
         elif ack == 1 and 1 <= state <= 3:
-            log.debug("[NI-B] GBA ack=1 state=%d (ni_b_expect=%d) — no action",
-                      state, self._ni_b_expect)
+            # Phase B — GBA's NIReceiver is ACKing the sub-frame we last delivered.
+            # _ni_b_expect encodes the NEXT sub-frame to send: 0=not armed,
+            # 2=send parent NI state=2, 3=send NI_END, 4=clear (done).
+            # Fire only when GBA's ack=1 state == _ni_b_expect - 1.
+            if self._ni_b_expect > 0 and state == self._ni_b_expect - 1:
+                if state < 3:
+                    next_state = state + 1
+                    frm = self._parent_ni_raw_frames.get(next_state, b"")
+                    if frm:
+                        frm_words = [len(frm)]
+                        for i in range(0, len(frm), 4):
+                            frm_words.append(int.from_bytes(
+                                frm[i:i + 4].ljust(4, b"\x00"), "little"))
+                        frm_msg = "HOST_DATA {} {}".format(
+                            len(frm_words),
+                            " ".join(f"0x{w:08X}" for w in frm_words))
+                        log.info("[NI-B] GBA NIReceiver ACKed state=%d → parent NI state=%d: %s",
+                                 state, next_state, frm_msg)
+                        self._ni_b_expect += 1  # arm for next ACK
+                        self._enqueue_host_data(frm_msg, port)
+                    else:
+                        log.warning("[NI-B] GBA NIReceiver ACKed state=%d but no raw frame for state=%d",
+                                    state, next_state)
+                else:
+                    # state=3 ACKed — NI handshake complete
+                    self._in_ni_handshake = False
+                    self._ni_b_expect = 0
+                    log.info("[NI-B] GBA NIReceiver ACKed NI_END — NI complete, UNI can start")
+            else:
+                log.debug("[NI-B] GBA ack=1 state=%d ignored (ni_b_expect=%d)",
+                          state, self._ni_b_expect)
 
     def on_ready(self, port: serial.Serial) -> None:
         """Called when RP2040 sends READY — dequeue and send one HOST_DATA.
@@ -570,13 +595,12 @@ class ConnectManager:
             # The GBA's librfu uses this as our adapter identity for the session.
             our_mac  = transport.our_mac or b"\x00\x00\x00\x00\x00\x01"
             our_id   = (our_mac[4] << 8 | our_mac[5]) & 0xFFFF or 0x0001
-            # clientNum: GBA wireless adapter slot numbers are 1-based.  The
-            # first (and only) child in a 2-player FRLG trade is slot 1.
+            # clientNum: GBA wireless adapter slot numbers are 0-based.  The
+            # first (and only) child in a 2-player FRLG trade is slot 0.
             # The 0x20 IsConnectionComplete response is (clientNum << 16) | our_id;
-            # the GBA's librfu checks bits 23-16 (the slot byte) to determine
-            # whether the connection is complete -- a zero slot byte means "not
-            # yet connected", even if our_id is non-zero.
-            client_num = 1
+            # the GBA detects "still connecting" via the exact sentinel 0x01000000,
+            # NOT via a zero clientNum byte, so client_num=0 is valid and yields slot 0.
+            client_num = 0
 
             with self._lock:
                 self._transport = transport
@@ -732,7 +756,7 @@ class ConnectManager:
                 # the NI HOST_DATA: w0=byte_count, w1..=LLSF bytes packed LE).
                 # n and phase are not preserved by gbaframe for UNI frames; 0 is
                 # sufficient for FRLG 2-player (no multi-frame windowing needed).
-                bm_slot  = 1 << (client_num - 1)
+                bm_slot  = 1 << client_num
                 llsf_hdr = ((4 << 14) | (bm_slot << 18) | 14).to_bytes(3, "little")
                 uni_slots = session.drain_host_slots()
                 if not uni_slots and join_notified:

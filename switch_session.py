@@ -119,9 +119,9 @@ class _PassthroughEngine:
         # Exposed via SwitchSession.host_ni_bytes for linkbridge.py → HOST_DATA.
         self._host_ni_frames = bytearray()
         self._host_ni_seen:  set = set()  # de-dup keys: state for NI_START, (state,n) for others
-        # GBA child slot number (1-based, from CONN_COMPLETE).  Used to set
-        # bmSlot in the reconstructed PARENT LLSF header (bmSlot = 1 << (client_num-1)).
-        self._client_num: int = 1        # default: first (and only) child
+        # GBA child slot number (0-based, from CONN_COMPLETE).  Used to set
+        # bmSlot in the reconstructed PARENT LLSF header (bmSlot = 1 << client_num).
+        self._client_num: int = 0        # default: first (and only) child
 
     # -- called by SwitchSession (from the UART thread) ---------------------
 
@@ -157,7 +157,7 @@ class _PassthroughEngine:
         if ni is not None and ni.get("ack") == 0:
             state = ni["state"]
             if state != _LCOM_NULL:
-                bm_slot   = 1 << (self._client_num - 1)
+                bm_slot   = 1 << self._client_num
                 llsf_int  = (state << 14) | (bm_slot << 18) | (ni["n"] << 11) | (ni["phase"] << 9) | ni["size"]
                 slot_b    = llsf_int.to_bytes(3, "little") + bytes(ni["payload"])[:ni["size"]]
                 # NI_START retransmits increment n — de-dup by state alone.
