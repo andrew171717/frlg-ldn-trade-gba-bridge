@@ -160,9 +160,9 @@ class _PassthroughEngine:
                 bm_slot   = 1 << self._client_num
                 llsf_int  = (state << 14) | (bm_slot << 18) | (ni["n"] << 11) | (ni["phase"] << 9) | ni["size"]
                 slot_b    = llsf_int.to_bytes(3, "little") + bytes(ni["payload"])[:ni["size"]]
-                # NI_START retransmits increment n — de-dup by state alone.
-                # NI/NI_END retransmits reuse the same n — de-dup by (state, n).
-                key = state if state == _LCOM_NI_START else (state, ni["n"])
+                # De-dup by (state, n) — each unique (state, n) pair is stored once.
+                # NI_START retransmits increment n, so n=1 and n=2 are distinct entries.
+                key = (state, ni["n"])
                 with self._lock:
                     if key not in self._host_ni_seen:
                         self._host_ni_seen.add(key)

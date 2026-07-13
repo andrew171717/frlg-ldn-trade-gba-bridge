@@ -347,18 +347,18 @@ class ConnectManager:
         self._hd_queue:        queue.SimpleQueue = queue.SimpleQueue()
         self._hd_lock:         threading.Lock    = threading.Lock()
         self._hd_ready_pending: bool             = False
-        # NI handshake: combined per-round responses after JOIN_GROUP_OK.
-        # For each GBA NISender sub-frame (ack=0, state 1-3) we reply with one
-        # HOST_DATA containing BOTH the parent's own NI sub-frame for that state
-        # AND the PARENT LLSF ACK of the GBA's sub-frame — matching the real
-        # wireless adapter which coalesces both into a single response per round.
-        # _parent_ni_raw_frames[state] = raw LLSF bytes for that parent NI sub-frame.
+        # NI handshake: relay Switch parent NI sub-frames to the GBA's NIReceiver.
+        # _ni_relay_queue: ordered list of parent NI LLSF frames from the Switch
+        #   (NI_START n=1, NI_START n=2, NI data, NI_END).  Populated on JOIN_GROUP_OK.
+        # _ni_relay_index: index of the frame currently being delivered to the GBA.
+        # Phase A coalesces [ACK of GBA NISender frame] + [relay_queue[relay_index]].
+        # Phase B advances relay_index as the GBA NIReceiver ACKs each delivered frame.
         # _pia_port is set while _run_pia runs so set_gba_data() can send HOST_DATA.
-        self._in_ni_handshake:     bool                    = False
-        self._ni_b_expect:         int                     = 0   # 0=inactive, 1-3=next state Phase B expects
-        self._client_num_cached:   int                     = 0
-        self._pia_port:            "serial.Serial | None"  = None
-        self._parent_ni_raw_frames: "dict[int, bytes]"     = {}
+        self._in_ni_handshake:   bool                   = False
+        self._ni_relay_queue:    "list[bytes]"          = []
+        self._ni_relay_index:    int                    = 0
+        self._client_num_cached: int                    = 0
+        self._pia_port:          "serial.Serial | None" = None
 
     # ------------------------------------------------------------------
     # Called from the serial-I/O thread
@@ -454,25 +454,29 @@ class ConnectManager:
         HOST_DATA queue so the READY handler can forward it.
         GBA payload layout: word[0]=framing header, word[1] low-u16=CHILD NI LLSF.
         """
-        s = self._session
-        if s is not None:
-            # word[0] is the GBA's slot identifier (0x900=slot0, 0x12000=slot1);
-            # it is part of the slot data the Switch needs and must not be stripped.
-            s.set_gba_words(words)
-
-        port = self._pia_port
-        if not self._in_ni_handshake or port is None or len(words) < 2:
-            return
-        child_llsf = words[1] & 0xFFFF
+        # Parse child LLSF early so we can filter before forwarding to the Switch.
+        child_llsf = (words[1] & 0xFFFF) if len(words) >= 2 else 0
         state = (child_llsf >> 10) & 0x1F
         ack   = (child_llsf >> 9)  & 1
         n     = (child_llsf >> 7)  & 3
         phase = (child_llsf >> 5)  & 3
 
+        s = self._session
+        if s is not None:
+            # Don't forward NIReceiver ACKs (ack=1, state=1-3) to the Switch.
+            # These are Phase B acknowledgments handled entirely by the bridge;
+            # passing them as slot data confuses the Switch's trade engine.
+            if not (ack == 1 and 1 <= state <= 3):
+                s.set_gba_words(words)
+
+        port = self._pia_port
+        if not self._in_ni_handshake or port is None or len(words) < 2:
+            return
+
         if ack == 0 and 1 <= state <= 3:
             # Phase A — GBA's NISender (ack=0).
             # Send ONE combined HOST_DATA: [PARENT LLSF ACK (3 bytes)] + [parent NI
-            # sub-frame for this state (from _parent_ni_raw_frames)].  This matches
+            # sub-frame (current relay_queue[relay_index]).  This matches
             # the real wireless adapter which coalesces both into a single 0x26 reply.
             # rfu_STC_CHILD_analyzeRecvPacket then sees:
             #   ack=1 LLSF → NISender advances to next state
@@ -480,7 +484,10 @@ class ConnectManager:
             bm_slot = 1 << self._client_num_cached
             parent_ack_int = (state << 14) | (bm_slot << 18) | (1 << 13) | (n << 11) | (phase << 9)
             ack_bytes = parent_ack_int.to_bytes(3, "little")
-            ni_frm = self._parent_ni_raw_frames.get(state, b"")
+            # Embed the current relay frame alongside the ACK.
+            # Phase B advances _ni_relay_index as the GBA ACKs each delivered frame.
+            idx    = self._ni_relay_index
+            ni_frm = self._ni_relay_queue[idx] if idx < len(self._ni_relay_queue) else b""
             combined = ack_bytes + ni_frm
             combined_words = [len(combined)]
             for i in range(0, len(combined), 4):
@@ -488,47 +495,42 @@ class ConnectManager:
                     combined[i:i + 4].ljust(4, b"\x00"), "little"))
             combined_msg = "HOST_DATA {} {}".format(
                 len(combined_words), " ".join(f"0x{w:08X}" for w in combined_words))
-            log.info("[NI-A] GBA state=%d n=%d ph=%d → %s", state, n, phase, combined_msg)
+            log.info("[NI-A] GBA state=%d n=%d ph=%d → %s (relay[%d])",
+                     state, n, phase, combined_msg, idx)
             self._enqueue_host_data(combined_msg, port)
-            # After delivering NI_START (state=1) to the GBA's NIReceiver, arm
-            # Phase B to deliver state=2 once the GBA ACKs state=1.  NIReceiver
-            # ignores sub-frames that arrive in later NISender rounds; it only
-            # processes each sub-frame in response to its own sequential ACKs.
-            if state == 1:
-                self._ni_b_expect = 2   # next to deliver: parent NI state=2
 
         elif ack == 1 and 1 <= state <= 3:
-            # Phase B — GBA's NIReceiver is ACKing the sub-frame we last delivered.
-            # _ni_b_expect encodes the NEXT sub-frame to send: 0=not armed,
-            # 2=send parent NI state=2, 3=send NI_END, 4=clear (done).
-            # Fire only when GBA's ack=1 state == _ni_b_expect - 1.
-            if self._ni_b_expect > 0 and state == self._ni_b_expect - 1:
-                if state < 3:
-                    next_state = state + 1
-                    frm = self._parent_ni_raw_frames.get(next_state, b"")
-                    if frm:
-                        frm_words = [len(frm)]
-                        for i in range(0, len(frm), 4):
-                            frm_words.append(int.from_bytes(
-                                frm[i:i + 4].ljust(4, b"\x00"), "little"))
-                        frm_msg = "HOST_DATA {} {}".format(
-                            len(frm_words),
-                            " ".join(f"0x{w:08X}" for w in frm_words))
-                        log.info("[NI-B] GBA NIReceiver ACKed state=%d → parent NI state=%d: %s",
-                                 state, next_state, frm_msg)
-                        self._ni_b_expect += 1  # arm for next ACK
-                        self._enqueue_host_data(frm_msg, port)
-                    else:
-                        log.warning("[NI-B] GBA NIReceiver ACKed state=%d but no raw frame for state=%d",
-                                    state, next_state)
-                else:
-                    # state=3 ACKed — NI handshake complete
-                    self._in_ni_handshake = False
-                    self._ni_b_expect = 0
-                    log.info("[NI-B] GBA NIReceiver ACKed NI_END — NI complete, UNI can start")
+            # Phase B — GBA NIReceiver ACKing a parent NI sub-frame we delivered.
+            # When the ACK matches relay_queue[relay_index], advance to the next frame.
+            idx = self._ni_relay_index
+            if idx >= len(self._ni_relay_queue):
+                log.debug("[NI-B] GBA ack=1 state=%d n=%d but relay queue exhausted", state, n)
+                return
+            current   = self._ni_relay_queue[idx]
+            hdr_int   = int.from_bytes(current[:3], "little")
+            frm_state = (hdr_int >> 14) & 0xF
+            frm_n     = (hdr_int >> 11) & 3
+            if state != frm_state or n != frm_n:
+                log.debug("[NI-B] GBA ack=1 state=%d n=%d ignored (current relay[%d] state=%d n=%d)",
+                          state, n, idx, frm_state, frm_n)
+                return
+            # ACK matches — advance and deliver the next frame (if any).
+            self._ni_relay_index += 1
+            nxt_idx = self._ni_relay_index
+            if nxt_idx < len(self._ni_relay_queue):
+                nxt = self._ni_relay_queue[nxt_idx]
+                nxt_words = [len(nxt)]
+                for i in range(0, len(nxt), 4):
+                    nxt_words.append(int.from_bytes(nxt[i:i + 4].ljust(4, b"\x00"), "little"))
+                nxt_msg = "HOST_DATA {} {}".format(
+                    len(nxt_words), " ".join(f"0x{w:08X}" for w in nxt_words))
+                log.info("[NI-B] GBA ACKed relay[%d] (state=%d n=%d) → relay[%d]: %s",
+                         idx, state, n, nxt_idx, nxt_msg)
+                self._enqueue_host_data(nxt_msg, port)
             else:
-                log.debug("[NI-B] GBA ack=1 state=%d ignored (ni_b_expect=%d)",
-                          state, self._ni_b_expect)
+                self._in_ni_handshake = False
+                log.info("[NI-B] GBA ACKed relay[%d] (state=%d n=%d) — NI complete, UNI can start",
+                         idx, state, n)
 
     def on_ready(self, port: serial.Serial) -> None:
         """Called when RP2040 sends READY — dequeue and send one HOST_DATA.
@@ -567,10 +569,10 @@ class ConnectManager:
         with self._hd_lock:
             self._hd_queue        = queue.SimpleQueue()
             self._hd_ready_pending = False
-        self._in_ni_handshake      = False
-        self._ni_b_expect          = 0
-        self._pia_port             = None
-        self._parent_ni_raw_frames = {}
+        self._in_ni_handshake = False
+        self._ni_relay_queue  = []
+        self._ni_relay_index  = 0
+        self._pia_port        = None
         log.info("[CONN] reset")
 
     # ------------------------------------------------------------------
@@ -726,18 +728,17 @@ class ConnectManager:
                         # Parse individual sub-frames for Phase B (NIReceiver ACK
                         # cycle): when GBA ACKs state S we send raw frame S+1.
                         ni_bytes = session.host_ni_bytes
-                        raw_frames: "dict[int, bytes]" = {}
+                        relay_queue: "list[bytes]" = []
                         off = 0
                         while off + 3 <= len(ni_bytes):
-                            hdr       = int.from_bytes(ni_bytes[off:off + 3], "little")
-                            frm_state = (hdr >> 14) & 0xF
-                            frm_size  = hdr & 0x7F
-                            raw_frames[frm_state] = bytes(ni_bytes[off:off + 3 + frm_size])
+                            hdr      = int.from_bytes(ni_bytes[off:off + 3], "little")
+                            frm_size = hdr & 0x7F
+                            relay_queue.append(bytes(ni_bytes[off:off + 3 + frm_size]))
                             off += 3 + frm_size
-                        self._parent_ni_raw_frames = raw_frames
-                        log.info("[CONN] Switch JOIN_GROUP_OK — parsed %d parent NI raw frames: %s",
-                                 len(raw_frames),
-                                 {s: f.hex() for s, f in raw_frames.items()})
+                        self._ni_relay_queue = relay_queue
+                        self._ni_relay_index = 0
+                        log.info("[CONN] Switch JOIN_GROUP_OK — relay queue %d frames: %s",
+                                 len(relay_queue), [f.hex() for f in relay_queue])
                         # No initial burst.  Phase A delivers each parent NI sub-frame
                         # combined with the PARENT LLSF ACK for that state (one per
                         # GBA NISender round).  This matches the real wireless adapter
