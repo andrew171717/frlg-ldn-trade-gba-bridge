@@ -26,15 +26,21 @@ Wire protocol (line-based ASCII, \\n terminated)
 RP2040 -> Pi:  SCAN_START\\n      start scanning the LDN for FRLG lobby beacons
                SCAN_RESULT\\n     request current host list (instant reply)
                SCAN_STOP\\n       stop scanning and clear the cache
+               DISCONNECT_CLIENT <mask>\\n
+                                   tear down the active client/session; mask uses
+                                   zero-based clientNumber bits
 
-Pi -> RP2040:  HOSTS <N>\\n              (only in response to SCAN_RESULT)
-               HOST <w0> ... <w6>\\n      (N lines; 7 LE u32 words, GBA 0x1D format)
-               ERR <msg>\\n              on unexpected errors
-               HOST_DATA <N> w0 ...\\n  N words; w0=LLSF byte count, w1..wN=Switch NI LLSF
-                                       bytes packed as u32 LE (NI_START→NI_END from the host).
-                                       rfu_STC_CHILD_analyzeRecvPacket reads w0 as
-                                       frames_remaining and w1.. as the NI sub-frame data.
-               DISCONNECT\\n            Switch rejected or cleanly disconnected
+Pi -> RP2040:  HOSTS <N>\n              (only in response to SCAN_RESULT)
+               HOST <w0> ... <w6>\n      (N lines; 7 LE u32 words, GBA 0x1D format)
+               ERR <msg>\n              on unexpected errors
+               HD<N><w0>...<wN-1>\n  Raw parent NI/control data from the Switch.
+                                       N words are packed as 8-char hex values (no spaces, no 0x).
+                                       w0 is the LLSF byte count; remaining words contain LLSF bytes.
+               UD8<w0>...<w7>\n       Compressed UNI data. Exactly 8 packed LE u32 words / 32 bytes:
+                                       3-byte PARENT LLSF header + slot0 (14 bytes) + slot1
+                                       (14 bytes) + one zero pad byte. The RP2040 expands this
+                                       to the 73-byte, five-slot parent UNI frame.
+               DISCONNECT\n            Switch rejected or cleanly disconnected
 
 HOST word layout — 7 plaintext words, GBA wireless adapter 0x1D BroadcastReadPoll format:
   w0 = id(u16) | slot(u8=0) | 0x00
@@ -72,10 +78,10 @@ Notes:
 
 import argparse
 import logging
-import queue
 import sys
 import threading
 import time
+from collections import deque
 
 import serial  # pyserial
 
@@ -341,24 +347,21 @@ class ConnectManager:
         # The main UART loop calls set_gba_data() on us, which routes here.
         self._session: "SwitchSession | None" = None
         # HOST_DATA flow control: RP2040 sends READY after each 0x26 to request
-        # the next slot.  Pi queues HOST_DATA strings and sends one per READY.
+        # the next slot. Pi queues HOST_DATA strings and sends one per READY.
         # If READY arrives before anything is queued, hd_ready_pending is set so
         # the next enqueue sends immediately instead of queuing.
-        self._hd_queue:        queue.SimpleQueue = queue.SimpleQueue()
-        self._hd_lock:         threading.Lock    = threading.Lock()
-        self._hd_ready_pending: bool             = False
-        # NI handshake: relay Switch parent NI sub-frames to the GBA's NIReceiver.
-        # _ni_relay_queue: ordered list of parent NI LLSF frames from the Switch
-        #   (NI_START n=1, NI_START n=2, NI data, NI_END).  Populated on JOIN_GROUP_OK.
-        # _ni_relay_index: index of the frame currently being delivered to the GBA.
-        # Phase A coalesces [ACK of GBA NISender frame] + [relay_queue[relay_index]].
-        # Phase B advances relay_index as the GBA NIReceiver ACKs each delivered frame.
-        # _pia_port is set while _run_pia runs so set_gba_data() can send HOST_DATA.
-        self._in_ni_handshake:   bool                   = False
-        self._ni_relay_queue:    "list[bytes]"          = []
-        self._ni_relay_index:    int                    = 0
-        self._client_num_cached: int                    = 0
-        self._pia_port:          "serial.Serial | None" = None
+        #
+        # _hd_inflight_msg is the message already handed to the RP2040 but not
+        # yet consumed by the next READY. Native NI frames use it, together with
+        # the queue tail, to collapse only consecutive retransmitted copies while
+        # preserving distinct state/phase transitions in strict FIFO order.
+        self._hd_queue: "deque[str]" = deque()
+        self._hd_lock: threading.Lock = threading.Lock()
+        self._hd_ready_pending: bool = False
+        self._hd_inflight_msg: "str | None" = None
+        # Recent child UNI slots are retained only for extraction verification.
+        self._recent_gba_uni_slots: "list[bytes]" = []
+        self._pia_port: "serial.Serial | None" = None
 
     # ------------------------------------------------------------------
     # Called from the serial-I/O thread
@@ -440,125 +443,168 @@ class ConnectManager:
         t.start()
 
     def set_gba_data(self, words: list) -> None:
-        """Route GBA_DATA from the UART loop to the active SwitchSession.
+        """Forward one physical-GBA NI/UNI CHILD slot to the Switch unchanged.
 
-        Called from the main serial-I/O thread each time the RP2040 sends a
-        GBA_DATA line (i.e. each 0x24/0x25 SendData command from the GBA).
-        `words` are u32 hex values straight from the UART line; set_gba_words()
-        handles the u32→u16 unpacking internally.
-
-        During the NI handshake phase the GBA's NISender is sending its own
-        NI sub-frames (NI_START → NI → NI_END) and waiting for PARENT LLSF
-        ACKs (ack=1) in each 0x26 response.  Without those ACKs the sender
-        retransmits forever.  We synthesise the ACK here and push it to the
-        HOST_DATA queue so the READY handler can forward it.
-        GBA payload layout: word[0]=framing header, word[1] low-u16=CHILD NI LLSF.
+        The RP2040's GBA_DATA words are the original 0x24/0x25 payload.
+        SwitchSession removes only the adapter framing word and queues the exact
+        CHILD LLSF bytes for the Pia Reliable 'T' stream.  LinkBridge does not
+        synthesize NI acknowledgements or maintain a second NI state machine.
         """
-        # Parse child LLSF early so we can filter before forwarding to the Switch.
-        child_llsf = (words[1] & 0xFFFF) if len(words) >= 2 else 0
-        state = (child_llsf >> 10) & 0x1F
-        ack   = (child_llsf >> 9)  & 1
-        n     = (child_llsf >> 7)  & 3
-        phase = (child_llsf >> 5)  & 3
-
-        s = self._session
-        if s is not None:
-            # Don't forward NIReceiver ACKs (ack=1, state=1-3) to the Switch.
-            # These are Phase B acknowledgments handled entirely by the bridge;
-            # passing them as slot data confuses the Switch's trade engine.
-            if not (ack == 1 and 1 <= state <= 3):
-                s.set_gba_words(words)
-
-        port = self._pia_port
-        if not self._in_ni_handshake or port is None or len(words) < 2:
+        session = self._session
+        if session is None:
+            log.debug("[NATIVE] dropping GBA_DATA before SwitchSession exists")
             return
 
-        if ack == 0 and 1 <= state <= 3:
-            # Phase A — GBA's NISender (ack=0).
-            # Send ONE combined HOST_DATA: [PARENT LLSF ACK (3 bytes)] + [parent NI
-            # sub-frame (current relay_queue[relay_index]).  This matches
-            # the real wireless adapter which coalesces both into a single 0x26 reply.
-            # rfu_STC_CHILD_analyzeRecvPacket then sees:
-            #   ack=1 LLSF → NISender advances to next state
-            #   ack=0 LLSF + payload → NIReceiver ingests the parent NI sub-frame
-            bm_slot = 1 << self._client_num_cached
-            parent_ack_int = (state << 14) | (bm_slot << 18) | (1 << 13) | (n << 11) | (phase << 9)
-            ack_bytes = parent_ack_int.to_bytes(3, "little")
-            # Embed the current relay frame alongside the ACK.
-            # Phase B advances _ni_relay_index as the GBA ACKs each delivered frame.
-            idx    = self._ni_relay_index
-            ni_frm = self._ni_relay_queue[idx] if idx < len(self._ni_relay_queue) else b""
-            combined = ack_bytes + ni_frm
-            combined_words = [len(combined)]
-            for i in range(0, len(combined), 4):
-                combined_words.append(int.from_bytes(
-                    combined[i:i + 4].ljust(4, b"\x00"), "little"))
-            combined_msg = "HOST_DATA {} {}".format(
-                len(combined_words), " ".join(f"0x{w:08X}" for w in combined_words))
-            log.info("[NI-A] GBA state=%d n=%d ph=%d → %s (relay[%d])",
-                     state, n, phase, combined_msg, idx)
-            self._enqueue_host_data(combined_msg, port)
+        try:
+            raw = session.queue_gba_wire_words(words)
+        except (TypeError, ValueError) as exc:
+            log.warning("[NATIVE] malformed GBA_DATA ignored: %s; words=%s",
+                        exc, " ".join(f"0x{int(w) & 0xFFFFFFFF:08X}" for w in words))
+            return
 
-        elif ack == 1 and 1 <= state <= 3:
-            # Phase B — GBA NIReceiver ACKing a parent NI sub-frame we delivered.
-            # When the ACK matches relay_queue[relay_index], advance to the next frame.
-            idx = self._ni_relay_index
-            if idx >= len(self._ni_relay_queue):
-                log.debug("[NI-B] GBA ack=1 state=%d n=%d but relay queue exhausted", state, n)
-                return
-            current   = self._ni_relay_queue[idx]
-            hdr_int   = int.from_bytes(current[:3], "little")
-            frm_state = (hdr_int >> 14) & 0xF
-            frm_n     = (hdr_int >> 11) & 3
-            if state != frm_state or n != frm_n:
-                log.debug("[NI-B] GBA ack=1 state=%d n=%d ignored (current relay[%d] state=%d n=%d)",
-                          state, n, idx, frm_state, frm_n)
-                return
-            # ACK matches — advance and deliver the next frame (if any).
-            self._ni_relay_index += 1
-            nxt_idx = self._ni_relay_index
-            if nxt_idx < len(self._ni_relay_queue):
-                nxt = self._ni_relay_queue[nxt_idx]
-                nxt_words = [len(nxt)]
-                for i in range(0, len(nxt), 4):
-                    nxt_words.append(int.from_bytes(nxt[i:i + 4].ljust(4, b"\x00"), "little"))
-                nxt_msg = "HOST_DATA {} {}".format(
-                    len(nxt_words), " ".join(f"0x{w:08X}" for w in nxt_words))
-                log.info("[NI-B] GBA ACKed relay[%d] (state=%d n=%d) → relay[%d]: %s",
-                         idx, state, n, nxt_idx, nxt_msg)
-                self._enqueue_host_data(nxt_msg, port)
-            else:
-                self._in_ni_handshake = False
-                log.info("[NI-B] GBA ACKed relay[%d] (state=%d n=%d) — NI complete, UNI can start",
-                         idx, state, n)
+        if not raw:
+            log.debug("[NATIVE] GBA→Switch empty child slot")
+            return
+
+        child = int.from_bytes(raw[:2].ljust(2, b"\x00"), "little")
+        state = (child >> 10) & 0x1F
+        ack   = (child >> 9) & 1
+        n     = (child >> 7) & 3
+        phase = (child >> 5) & 3
+        size  = child & 0x1F
+        if state == 4 and len(raw) >= 16:
+            self._recent_gba_uni_slots.append(raw[2:16])
+            del self._recent_gba_uni_slots[:-8]
+        log.info("[NATIVE] GBA→Switch state=%d ack=%d n=%d ph=%d size=%d raw=%s",
+                 state, ack, n, phase, size, raw.hex())
+
+    @staticmethod
+    def _raw_host_frame_to_hd(raw: bytes) -> str:
+        """Pack raw parent LLSF bytes into the existing HD wire format."""
+        words = [len(raw)]
+        for i in range(0, len(raw), 4):
+            words.append(int.from_bytes(raw[i:i + 4].ljust(4, b"\x00"), "little"))
+        return "HD{}{}".format(
+            len(words), "".join(f"{word:08X}" for word in words)
+        )
 
     def on_ready(self, port: serial.Serial) -> None:
         """Called when RP2040 sends READY — dequeue and send one HOST_DATA.
 
-        If the queue is empty the READY is remembered; the next enqueue
-        will send immediately instead of queuing (handles the race where
-        READY arrives before the Pi has produced its first HOST_DATA).
+        READY means the previously delivered HOST_DATA has been consumed, so
+        its in-flight de-duplication guard can be cleared. If the queue is empty,
+        READY is remembered and the next enqueue is sent immediately.
         """
         msg = None
         with self._hd_lock:
-            try:
-                msg = self._hd_queue.get_nowait()
-            except queue.Empty:
+            self._hd_inflight_msg = None
+            if self._hd_queue:
+                msg = self._hd_queue.popleft()
+                self._hd_inflight_msg = msg
+            else:
                 self._hd_ready_pending = True
         if msg is not None:
-            _send(port, msg)
+            self._send_host_data(msg, port)
 
-    def _enqueue_host_data(self, msg: str, port: serial.Serial) -> None:
-        """Queue a HOST_DATA message; send immediately if READY is already pending."""
+    def _enqueue_host_data(self, msg: str, port: serial.Serial,
+                           *, collapse_consecutive: bool = False) -> bool:
+        """Queue one HOST_DATA message and preserve FIFO protocol transitions.
+
+        For native NI traffic, ``collapse_consecutive`` removes only repeated
+        copies of the message currently in flight or directly at the queue tail.
+        A distinct state/phase is always appended in order. Once READY consumes
+        the current message, the same value may be queued again later, allowing
+        genuine protocol retries without an unbounded duplicate backlog.
+
+        Returns True when the message was sent or queued, False when it was
+        collapsed as a consecutive duplicate.
+        """
         send_now = False
         with self._hd_lock:
+            if collapse_consecutive:
+                if msg == self._hd_inflight_msg:
+                    return False
+                if self._hd_queue and self._hd_queue[-1] == msg:
+                    return False
+
             if self._hd_ready_pending:
                 self._hd_ready_pending = False
+                self._hd_inflight_msg = msg
                 send_now = True
             else:
-                self._hd_queue.put(msg)
+                self._hd_queue.append(msg)
+
         if send_now:
-            _send(port, msg)
+            self._send_host_data(msg, port)
+        return True
+
+    def _send_host_data(self, msg: str, port: serial.Serial) -> None:
+        """Write one queued parent RFU message to the RP2040."""
+        _send(port, msg)
+
+    def _forward_uni_slot(self, raw_slot: bytes,
+                          log_label: str, port: serial.Serial) -> None:
+        """Send the first two UNI slots in a fixed 32-byte UD8 message.
+
+        UD8 is the first eight packed words of the final five-slot parent UNI
+        frame: 3-byte PARENT LLSF header, 14-byte slot0, 14-byte slot1, and
+        one zero byte that is also the first byte of empty slot2.
+        """
+        source = bytes(raw_slot)
+        if len(source) < 3:
+            log.warning("[UNI] %s: frame too short for PARENT LLSF (%d bytes)",
+                        log_label, len(source))
+            return
+
+        llsf_int    = int.from_bytes(source[:3], "little")
+        source_size = llsf_int & 0x1FF
+        state       = (llsf_int >> 14) & 0x0F
+        bm_slot     = (llsf_int >> 18) & 0x0F
+        recv_first  = (llsf_int >> 22) & 0x03
+
+        if state != 4:
+            log.warning("[UNI] %s: refusing non-UNI frame state=%d", log_label, state)
+            return
+        if recv_first != 0:
+            log.warning("[UNI] %s: recvFirst=%d; physical slot1 may not be client slot 0",
+                        log_label, recv_first)
+
+        # Parent layout is header[3], then contiguous 14-byte slots.
+        slot0 = source[3:17].ljust(14, b"\x00")
+        slot1 = source[17:31].ljust(14, b"\x00")
+
+        # Advertise the complete five-slot server payload while transmitting
+        # only the first two slots over UART.
+        llsf_int = (llsf_int & ~0x1FF) | 70
+        compressed = llsf_int.to_bytes(3, "little") + slot0 + slot1
+        if len(compressed) != 31:
+            raise AssertionError(
+                f"compressed UNI prefix is {len(compressed)} bytes, expected 31"
+            )
+
+        packed = compressed + b"\x00"
+        words = [int.from_bytes(packed[i:i + 4], "little")
+                 for i in range(0, 32, 4)]
+        msg = "UD8" + "".join(f"{w:08X}" for w in words)
+
+        match_age = None
+        for age, prior in enumerate(reversed(self._recent_gba_uni_slots)):
+            if slot1 == prior:
+                match_age = age
+                break
+        if match_age is None:
+            slot1_check = ("unverified" if not self._recent_gba_uni_slots
+                           else "NO RECENT GBA MATCH")
+        else:
+            slot1_check = f"matches GBA slot from {match_age} frame(s) ago"
+
+        log.info(
+            "[UNI] %s: %s state=%d size=%d→70 bmSlot=0x%X recvFirst=%d "
+            "slot0=%s slot1=%s slot1Check=%s",
+            log_label, msg, state, source_size, bm_slot, recv_first,
+            slot0.hex(), slot1.hex(), slot1_check,
+        )
+        self._enqueue_host_data(msg, port)
 
     def reset(self) -> None:
         """Tear down any active join/session loop and return to IDLE.  Called on adapter reset."""
@@ -567,12 +613,11 @@ class ConnectManager:
             self._teardown_locked()
             self._state = self.IDLE
         with self._hd_lock:
-            self._hd_queue        = queue.SimpleQueue()
+            self._hd_queue.clear()
             self._hd_ready_pending = False
-        self._in_ni_handshake = False
-        self._ni_relay_queue  = []
-        self._ni_relay_index  = 0
-        self._pia_port        = None
+            self._hd_inflight_msg = None
+        self._pia_port             = None
+        self._recent_gba_uni_slots = []
         log.info("[CONN] reset")
 
     # ------------------------------------------------------------------
@@ -582,113 +627,107 @@ class ConnectManager:
     def _do_join(self, rfu_id: int, comm_id: "int | None",
                 app_data: "bytes | None", rfutgt: "bytes | None",
                 port: serial.Serial) -> None:
-        # Phase 1: LDN join.  Failure here sends CONN_FAILED.
+        """Join LDN, establish Pia/RFU, then expose completion to the GBA.
+
+        CONN_COMPLETE is deliberately delayed until the Switch accepts the
+        emulator RFU connect ('A').  That synchronizes the physical GBA's NI
+        start with the real Switch endpoint instead of starting a second, early
+        synthetic NI handshake in LinkBridge.
+        """
         try:
             transport = LiveTransport(
                 keys_path=self._keys_path,
                 phyname=self._phyname,
                 ifname="ldnclient",
-                local_comm_id=comm_id,       # None → LiveTransport picks first FRLG match
+                local_comm_id=comm_id,
                 log=log.debug,
             )
             transport.start(timeout=30, attempts=3)
 
-            # Derive a 16-bit client ID from our LDN MAC (bytes 4-5, big-endian).
-            # The GBA's librfu uses this as our adapter identity for the session.
-            our_mac  = transport.our_mac or b"\x00\x00\x00\x00\x00\x01"
-            our_id   = (our_mac[4] << 8 | our_mac[5]) & 0xFFFF or 0x0001
-            # clientNum: GBA wireless adapter slot numbers are 0-based.  The
-            # first (and only) child in a 2-player FRLG trade is slot 0.
-            # The 0x20 IsConnectionComplete response is (clientNum << 16) | our_id;
-            # the GBA detects "still connecting" via the exact sentinel 0x01000000,
-            # NOT via a zero clientNum byte, so client_num=0 is valid and yields slot 0.
+            our_mac = transport.our_mac or b"\x00\x00\x00\x00\x00\x01"
+            our_id = ((our_mac[4] << 8) | our_mac[5]) & 0xFFFF or 0x0001
             client_num = 0
 
             with self._lock:
                 self._transport = transport
-                self._state     = self.COMPLETE
+                # Stay PENDING until SwitchSession.rfu_ready.
+                self._state = self.PENDING
 
-            log.info("[CONN] join SUCCESS rfu_id=0x%04x our_id=0x%04x clientNum=%d",
-                     rfu_id, our_id, client_num)
-            _send(port, f"CONN_COMPLETE {client_num} 0x{our_id:04x}")
+            log.info(
+                "[CONN] LDN join SUCCESS rfu_id=0x%04x our_id=0x%04x "
+                "clientNum=%d — waiting for Pia/RFU accept",
+                rfu_id, our_id, client_num,
+            )
 
-        except Exception as e:
-            reason = str(e).splitlines()[0][:80]
+        except Exception as exc:
+            reason = str(exc).splitlines()[0][:80]
             with self._lock:
                 self._state = self.FAILED
             log.error("[CONN] join FAILED rfu_id=0x%04x: %s", rfu_id, reason)
             _send(port, f"CONN_FAILED {reason}")
-            return   # do not proceed to Pia
+            return
 
-        # Phase 2: Pia S0 connection layer + data relay.
-        # IMPORTANT: this runs OUTSIDE the try/except above.  Any exception here
-        # must NOT send CONN_FAILED -- the RP2040 already received CONN_COMPLETE
-        # and told the GBA the connection succeeded.  Sending CONN_FAILED now would
-        # corrupt the RP2040 state machine (state flips COMPLETE → FAILED, causing
-        # 0x21 to return 0x00000000 and the GBA to time out).
         try:
-            self._run_pia(transport, port, rfutgt, client_num)
+            self._run_pia(transport, port, rfutgt, client_num, our_id)
         except Exception as exc:
-            log.error("[CONN] Pia S0 unexpected error (CONN_COMPLETE already sent): %s", exc)
+            reason = str(exc).splitlines()[0][:80]
+            with self._lock:
+                state = self._state
+                if state == self.PENDING:
+                    self._state = self.FAILED
+            if state == self.PENDING and not self._sim_stop.is_set():
+                log.error("[CONN] Pia/RFU setup FAILED before CONN_COMPLETE: %s", reason)
+                _send(port, f"CONN_FAILED {reason}")
+            else:
+                log.error("[CONN] Pia session error after connection: %s", reason)
 
     def _run_pia(self, transport: LiveTransport,
-                port: serial.Serial, rfutgt: "bytes | None",
-                client_num: int = 1) -> None:
-        """Run the Pia S0 connection layer + UNI data relay loop via SwitchSession.
+                 port: serial.Serial, rfutgt: "bytes | None",
+                 client_num: int, our_id: int) -> None:
+        """Run Pia transport and relay native RFU slots in both directions.
 
-        - Net 0x11→0x12: Switch recognises us as a Pia peer.
-        - Session join: Switch registers us as a participant.
-        - RTT keepalive: keeps the session alive.
-        - NI handshake: game-data exchange; once complete the Switch confirms
-          JOIN_GROUP_OK — we forward JOIN_OK to the RP2040.
-        - UNI: each non-idle host slot is packed and sent as HOST_DATA.
-
-        Ticks at ~60 Hz until _sim_stop is set (by reset()).
+        Sim still owns encryption, Pia Reliable, retransmission, K frames and
+        connection traffic.  The physical GBA owns NI and UNI state: child slots
+        are forwarded unchanged to the Switch, and parent slots are returned
+        unchanged to the RP2040 (UNI keeps the existing UD8 UART compression).
         """
         import os as _os
         try:
             from frlgsim import crypto as cryptomod, pia_connect, linkplayer
-        except ImportError as e:
-            log.error("[CONN] Pia S0: missing dependency: %s — sync frlgsim to the Pi", e)
-            return
+        except ImportError as exc:
+            raise RuntimeError(f"missing frlgsim dependency: {exc}") from exc
 
         if not transport.ssid:
-            log.error("[CONN] Pia S0: transport has no SSID; cannot initialise crypto")
-            return
+            raise RuntimeError("transport has no SSID; cannot initialise Pia crypto")
 
-        # Build a LinkPlayer from the GBA's rfutgt record so the NI game-data
-        # sub-frame carries the real trainer name and TID (not the "EMU" defaults).
-        lp = linkplayer.LinkPlayer()    # defaults: name="EMU", version=LeafGreen
+        # Identity is still needed for the Pia/session metadata and LDN presence,
+        # but no synthetic NI payload is generated from it in native mode.
+        lp = linkplayer.LinkPlayer()
         if rfutgt is not None:
             try:
-                r       = decode_record(rfutgt)
-                name    = frlg_text(r["uname_bytes"]) or "GBA"
-                tid     = r["player_tid"] & 0xFFFF
-                # version field is only 3 bits in the rfutgt record; map to LP constant.
-                ver_raw = r.get("version", 4) & 0x07
-                if ver_raw == 5:
-                    version = linkplayer.VERSION_LEAF_GREEN   # 0x4005
-                else:
-                    version = linkplayer.VERSION_FIRE_RED     # 0x4004 (default)
+                record = decode_record(rfutgt)
+                name = frlg_text(record["uname_bytes"]) or "GBA"
+                tid = record["player_tid"] & 0xFFFF
+                ver_raw = record.get("version", 4) & 0x07
+                version = (linkplayer.VERSION_LEAF_GREEN if ver_raw == 5
+                           else linkplayer.VERSION_FIRE_RED)
                 lp = linkplayer.LinkPlayer(name=name, trainer_id=tid, version=version)
-                log.info("[CONN] Pia NI: using GBA trainer %r TID=0x%04x version=0x%04x",
+                log.info("[CONN] Pia identity: GBA trainer %r TID=0x%04x version=0x%04x",
                          name, tid, version)
             except Exception as exc:
-                log.warning("[CONN] Pia NI: could not decode rfutgt: %s — using defaults", exc)
+                log.warning("[CONN] could not decode rfutgt identity: %s — using defaults", exc)
 
-        pc   = cryptomod.PiaCrypto(transport.ssid)
+        pc = cryptomod.PiaCrypto(transport.ssid)
         conn = pia_connect.ConnectionManager(
-            our_mac     = transport.our_mac  or b"\x00" * 6,
-            host_mac    = transport.host_mac or b"\x00" * 6,
-            our_ip      = transport.our_ip,
-            host_ip     = transport.host_ip,
-            player_name = lp.name,
-            random4     = _os.urandom(4),
-            log         = log.debug,
+            our_mac=transport.our_mac or b"\x00" * 6,
+            host_mac=transport.host_mac or b"\x00" * 6,
+            our_ip=transport.our_ip,
+            host_ip=transport.host_ip,
+            player_name=lp.name,
+            random4=_os.urandom(4),
+            log=log.debug,
         )
-        # Random nonzero 2-byte RFU connect id ('C' frame).  Any nonzero value
-        # works; a fresh id per run avoids the host's ~40 s lost-id re-join lockout.
-        raw_id     = int.from_bytes(_os.urandom(2), "big") or 1
+        raw_id = int.from_bytes(_os.urandom(2), "big") or 1
         connect_id = raw_id.to_bytes(2, "big")
 
         session = SwitchSession(
@@ -700,95 +739,86 @@ class ConnectManager:
         with self._lock:
             self._session = session
 
-        period        = 1.0 / 59.727
-        announced     = False
-        join_notified = False
-        self._pia_port = port   # expose port to set_gba_data() for NI ACK delivery
-        log.info("[CONN] Pia S0: starting (Net 0x11 → Session join → NI handshake)...")
+        self._pia_port = port
+        period = 1.0 / 59.727
+        pia_announced = False
+        completion_sent = False
+        join_status_logged = False
+        log.info("[CONN] Pia S0 starting; native GBA↔Switch NI relay armed")
 
         try:
             while not self._sim_stop.is_set():
-                try:
-                    session.tick()
-                except Exception as exc:
-                    log.error("[CONN] Pia S0: tick() error: %s", exc)
-                    break
+                session.tick()
 
-                if session.connected and not announced:
-                    announced = True
-                    log.info("[CONN] Pia S0: CONNECTED — Switch should now show the join prompt")
+                if session.connected and not pia_announced:
+                    pia_announced = True
+                    log.info("[CONN] Pia S0 CONNECTED — waiting for Switch RFU accept ('A')")
 
-                # NI join status: forward JOIN_OK (or disconnect on rejection) once.
-                # join_status_pending fires only after ni_recv.complete (NI_END received),
-                # so host_ni_bytes contains the full NI_START→NI_END LLSF byte sequence.
-                if not join_notified and session.join_status_pending:
+                if session.rfu_ready and not completion_sent:
+                    completion_sent = True
+                    with self._lock:
+                        self._state = self.COMPLETE
+                    _send(port, f"CONN_COMPLETE {client_num} 0x{our_id:04x}")
+                    log.info(
+                        "[CONN] Switch RFU accepted — sent CONN_COMPLETE; "
+                        "physical GBA now owns the native NI handshake"
+                    )
+
+                # Keep join-status parsing only as diagnostics.  The raw parent
+                # status frame itself is forwarded to the physical GBA below.
+                if session.join_status_pending and not join_status_logged:
                     status = session.consume_join_status()
-                    join_notified = True
-                    if status == SwitchSession.JOIN_GROUP_OK:
-                        # Parse individual sub-frames for Phase B (NIReceiver ACK
-                        # cycle): when GBA ACKs state S we send raw frame S+1.
-                        ni_bytes = session.host_ni_bytes
-                        relay_queue: "list[bytes]" = []
-                        off = 0
-                        while off + 3 <= len(ni_bytes):
-                            hdr      = int.from_bytes(ni_bytes[off:off + 3], "little")
-                            frm_size = hdr & 0x7F
-                            relay_queue.append(bytes(ni_bytes[off:off + 3 + frm_size]))
-                            off += 3 + frm_size
-                        self._ni_relay_queue = relay_queue
-                        self._ni_relay_index = 0
-                        log.info("[CONN] Switch JOIN_GROUP_OK — relay queue %d frames: %s",
-                                 len(relay_queue), [f.hex() for f in relay_queue])
-                        # No initial burst.  Phase A delivers each parent NI sub-frame
-                        # combined with the PARENT LLSF ACK for that state (one per
-                        # GBA NISender round).  This matches the real wireless adapter
-                        # which always coalesces ACK + NI sub-frame in one 0x26 response.
-                        self._client_num_cached = client_num
-                        self._in_ni_handshake   = True
-                    else:
-                        log.warning("[CONN] Switch join rejected (status=%d) — disconnecting", status)
-                        _send(port, "DISCONNECT")
-                        break
+                    join_status_logged = True
+                    log.info("[NATIVE] observed Switch NI join status=%s; forwarded raw to GBA",
+                             status)
 
-                # Switch → GBA: forward UNI host slots as HOST_DATA.
-                # Each slot is 14 raw bytes (gRecvCmds) from drain_host_slots().
-                # We must prepend the 3-byte PARENT LLSF header before sending
-                # so rfu_STC_CHILD_analyzeRecvPacket can parse it (same format as
-                # the NI HOST_DATA: w0=byte_count, w1..=LLSF bytes packed LE).
-                # n and phase are not preserved by gbaframe for UNI frames; 0 is
-                # sufficient for FRLG 2-player (no multi-frame windowing needed).
-                bm_slot  = 1 << client_num
-                llsf_hdr = ((4 << 14) | (bm_slot << 18) | 14).to_bytes(3, "little")
-                uni_slots = session.drain_host_slots()
-                if not uni_slots and join_notified:
-                    log.debug("[UNI] drain_host_slots() empty this tick")
-                for slot_bytes in uni_slots:
-                    if not join_notified or self._in_ni_handshake:
-                        continue          # discard until GBA NI handshake is complete
-                    uni_bytes = llsf_hdr + bytes(slot_bytes[:14])   # 17 bytes
-                    words = [len(uni_bytes)]
-                    for i in range(0, len(uni_bytes), 4):
-                        words.append(int.from_bytes(
-                            uni_bytes[i:i + 4].ljust(4, b"\x00"), "little"))
-                    msg = "HOST_DATA {} {}".format(
-                        len(words), " ".join(f"0x{w:08X}" for w in words))
-                    log.info("[UNI] Switch→GBA slot: %s  raw=%s",
-                             msg, slot_bytes[:14].hex())
-                    self._enqueue_host_data(msg, port)
+                for frame in session.drain_frames():
+                    raw = bytes(frame.get("raw_slot") or b"")
+                    if not raw:
+                        continue
 
-                # Clean disconnect signals.
-                if session.ni_rejected or session.host_disconnected:
+                    state = frame.get("llsf_state")
+                    if state == 4:
+                        self._forward_uni_slot(raw, "Switch→GBA: NATIVE UNI", port)
+                        continue
+
+                    header = int.from_bytes(raw[:3].ljust(3, b"\x00"), "little")
+                    size = header & 0x1FF
+                    phase = (header >> 9) & 0x03
+                    n = (header >> 11) & 0x03
+                    ack = (header >> 13) & 0x01
+                    ni_state = (header >> 14) & 0x0F
+                    msg = self._raw_host_frame_to_hd(raw)
+                    log.info(
+                        "[NATIVE] Switch→GBA state=%d ack=%d n=%d ph=%d "
+                        "size=%d raw=%s → %s",
+                        ni_state, ack, n, phase, size, raw.hex(), msg,
+                    )
+                    # Parent NI is a current protocol level that may repeat each
+                    # VBlank.  Replace stale unsent copies rather than building a
+                    # queue the GBA can never drain.  A distinct next state cannot
+                    # appear until the GBA's previous ACK reached the Switch.
+                    queued = self._enqueue_host_data(
+                        msg, port, collapse_consecutive=True
+                    )
+                    if not queued:
+                        log.debug(
+                            "[NATIVE] collapsed consecutive Switch→GBA frame "
+                            "state=%d ack=%d n=%d ph=%d raw=%s",
+                            ni_state, ack, n, phase, raw.hex(),
+                        )
+
+                if session.host_disconnected:
                     _send(port, "DISCONNECT")
                     break
 
                 time.sleep(period)
         finally:
-            self._in_ni_handshake = False
-            self._pia_port        = None
+            self._pia_port = None
             with self._lock:
                 if self._session is session:
                     self._session = None
-            log.info("[CONN] Pia S0: loop exited")
+            log.info("[CONN] Pia S0/native relay loop exited")
 
     # ------------------------------------------------------------------
     # Internal helpers (call with _lock held)
@@ -985,6 +1015,17 @@ def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
                 elif cmd == "SCAN_STOP":
                     scanner.stop()
 
+                elif cmd.startswith("DISCONNECT_CLIENT"):
+                    parts = line.split()
+                    try:
+                        mask = int(parts[1], 0) & 0x0F if len(parts) > 1 else 0
+                    except ValueError:
+                        log.warning("[CONN] malformed DISCONNECT_CLIENT: %r", line)
+                    else:
+                        log.info("[CONN] GBA DisconnectClient mask=0x%X — tearing down session", mask)
+                        connector.reset()
+                        scanner.stop()
+
                 elif line.upper().startswith("GBA_DATA "):
                     # "GBA_DATA N 0x<w0> 0x<w1> ..."
                     # GBA's 0x24/0x25 slot payload from the RP2040.  Route to the
@@ -994,7 +1035,6 @@ def run(port_path: str, baud: int, phyname: str, keys_path: str) -> None:
                     try:
                         count = int(parts[1], 10)
                         words = [int(w, 16) for w in parts[2 : 2 + count]]
-                        log.info("[RELAY] GBA→Switch: %s", " ".join(f"0x{w:08X}" for w in words))
                         connector.set_gba_data(words)
                     except (IndexError, ValueError):
                         log.warning("[RELAY] malformed GBA_DATA: %r", line)

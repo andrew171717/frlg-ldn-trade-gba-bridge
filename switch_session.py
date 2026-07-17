@@ -48,8 +48,8 @@ Key public interface
 --------------------
 tick()                    Drive one Pia VBlank.  Receives from Switch, runs
                           retransmit timers, sends the current GBA slot.
-set_gba_slot(words)       Supply the GBA's current 7-int slot (u16s).  Will be
-                          packed and sent to the Switch on the next tick.
+queue_gba_wire_words()    Queue one raw GBA wireless-adapter child slot from
+                          a 0x24/0x25 payload for native forwarding.
 drain_frames()            Return (and clear) all parsed UNI frames the Switch
                           sent since the last drain.  Each is a parse_in() dict.
 join_status_pending       True exactly once: when the Switch's NI join status
@@ -66,6 +66,7 @@ host_disconnected         True if the Switch sent an emulator 'D' disconnect.
 """
 
 import threading
+from collections import deque
 
 from frlgsim import gbaframe, rfu as _rfu
 from frlgsim.sim import Sim
@@ -107,8 +108,9 @@ class _PassthroughEngine:
 
     def __init__(self) -> None:
         self._lock     = threading.Lock()
-        self._slot     = [0] * 7    # 7 u16s — what the GBA last sent
-        self._incoming: list = []   # parsed Switch frames waiting to be drained
+        self._slot     = [0] * 7    # legacy 7-u16 UNI slot interface
+        self._raw_outgoing = deque() # exact CHILD LLSF slots waiting for the Switch
+        self._incoming: list = []    # parsed Switch frames waiting to be drained
 
         # LinkPlayer for the NI sender in Sim._ensure_ni().  Set by SwitchSession
         # after construction (before the first tick that needs it).
@@ -126,9 +128,35 @@ class _PassthroughEngine:
     # -- called by SwitchSession (from the UART thread) ---------------------
 
     def set_gba_slot(self, words: list) -> None:
-        """Store the GBA's current slot (7 u16s).  Thread-safe."""
+        """Store the legacy seven-u16 UNI command slot.  Thread-safe."""
         with self._lock:
             self._slot = list(words)
+
+    def queue_raw_slot(self, slot: bytes) -> bool:
+        """Queue one exact CHILD LLSF slot for native GBA→Switch relay.
+
+        Collapse only when the same raw slot is already directly in front of
+        this one at the queue tail. A matching slot is accepted again after the
+        prior copy has been popped, so real GBA retries are still forwarded.
+
+        Returns True when queued, False for an empty or consecutive duplicate
+        slot.
+        """
+        raw = bytes(slot)
+        if not raw:
+            return False
+        with self._lock:
+            if self._raw_outgoing and self._raw_outgoing[-1] == raw:
+                return False
+            self._raw_outgoing.append(raw)
+            return True
+
+    def pop_raw_slot(self):
+        """Pop the oldest exact CHILD LLSF slot, or None when no slot is ready."""
+        with self._lock:
+            if not self._raw_outgoing:
+                return None
+            return self._raw_outgoing.popleft()
 
     def drain(self) -> list:
         """Return and clear all queued incoming frames.  Thread-safe."""
@@ -175,6 +203,43 @@ class _PassthroughEngine:
 
 
 # ---------------------------------------------------------------------------
+# Native GBA slot driver
+# ---------------------------------------------------------------------------
+
+class _NativeBridgeSim(Sim):
+    """Use Sim's Pia/Reliable transport but never synthesize RFU NI/UNI slots.
+
+    The physical GBA owns the librfu state machines.  Every child slot emitted
+    by this class came directly from a GBA 0x24/0x25 payload.  Incoming parent
+    slots are still parsed by Sim so its K acknowledgements and Reliable window
+    remain intact, but Sim's synthetic NISender and NIReceiver ACK generator are
+    bypassed completely.
+    """
+
+    def _gba_frame(self):
+        self._emitted_ni_ack = None
+        slot = self.engine.pop_raw_slot()
+        if slot is None:
+            return None
+
+        parsed = _rfu.parse_llsf_child(slot) if len(slot) >= 2 else None
+        if parsed is None:
+            self.log(f"[NATIVE] GBA→Switch raw child slot ({len(slot)}B): {slot.hex()}")
+        else:
+            self.log(
+                "[NATIVE] GBA→Switch child "
+                f"state={parsed.get('state', '?')} ack={parsed.get('ack', '?')} "
+                f"n={parsed.get('n', '?')} phase={parsed.get('phase', '?')} "
+                f"size={parsed.get('size', '?')} raw={slot.hex()}"
+            )
+            if parsed.get('state') == 4:
+                # Diagnostic compatibility for callers that inspect ni_done.
+                self._ni_done = True
+
+        return self._wrap_t(slot)
+
+
+# ---------------------------------------------------------------------------
 # Public session class
 # ---------------------------------------------------------------------------
 
@@ -209,7 +274,7 @@ class SwitchSession:
         self._engine     = _PassthroughEngine()
         self._engine.lp  = lp
 
-        self._sim = Sim(
+        self._sim = _NativeBridgeSim(
             transport, pia_crypto, self._engine,
             our_ip, host_ip,
             conn=conn,
@@ -248,35 +313,63 @@ class SwitchSession:
         self._poll_join_status()
 
     def set_gba_slot(self, words: list) -> None:
-        """Provide the GBA's current 7-word slot (u16s) to forward to the Switch.
+        """Queue a legacy seven-u16 UNI command slot.
 
-        Call this each tick after reading from the RP2040.  The value is
-        held until overwritten; it is safe to call from a different thread.
-
-        `words` must be 7 integers (each a u16).  For u32 SPI words use
-        set_gba_words() instead.
+        Native LinkBridge code should call queue_gba_wire_words() so NI and UNI
+        CHILD LLSF bytes are preserved exactly.  This method remains as a
+        compatibility helper for callers that only have a 14-byte UNI command.
         """
-        self._engine.set_gba_slot(words)
+        u16s = [(int(w) & 0xFFFF) for w in words[:7]]
+        u16s += [0] * (7 - len(u16s))
+        cmd14 = b"".join(v.to_bytes(2, "little") for v in u16s[:7])
+        self._engine.queue_raw_slot(_rfu.uni_slot(cmd14))
+
+    @staticmethod
+    def decode_gba_wire_slot(u32_words: list) -> bytes:
+        """Extract the exact CHILD LLSF slot from one GBA_DATA payload.
+
+        The RP2040 forwards the wireless-adapter 0x24/0x25 payload unchanged:
+        word 0 contains the RFU byte count in bits 8..15, while words 1..N
+        contain the CHILD LLSF and payload packed little-endian.
+        """
+        if not u32_words:
+            raise ValueError("empty GBA_DATA payload")
+
+        header = int(u32_words[0]) & 0xFFFFFFFF
+        slot_len = (header >> 8) & 0xFF
+        packed = b"".join(
+            (int(word) & 0xFFFFFFFF).to_bytes(4, "little")
+            for word in u32_words[1:]
+        )
+
+        if slot_len == 0:
+            return b""
+        if slot_len > 16:
+            raise ValueError(f"invalid CHILD slot length {slot_len}; maximum is 16")
+        if slot_len > len(packed):
+            raise ValueError(
+                f"CHILD slot length {slot_len} exceeds {len(packed)} payload bytes"
+            )
+        return packed[:slot_len]
+
+    def queue_gba_wire_words(self, u32_words: list) -> bytes:
+        """Queue one exact NI or UNI CHILD slot from the RP2040.
+
+        Returns the extracted raw slot for logging/tests. An empty slot is not
+        queued. A slot identical to the current queue tail is collapsed; the
+        same slot can be queued again after the prior copy has been popped.
+        """
+        raw = self.decode_gba_wire_slot(u32_words)
+        if raw:
+            self._engine.queue_raw_slot(raw)
+        return raw
 
     def set_gba_words(self, u32_words: list) -> None:
-        """Convert 4 u32 SPI words from the RP2040 to 7 u16s and store them.
-
-        Each u32 carries two u16 values (low half then high half), matching
-        the GBA wireless adapter SPI protocol.  This is what to call when the
-        RP2040 sends a GBA_DATA line — parse the hex words, pass them here.
-
-            parts = line.split()                          # "GBA_DATA 4 0x... ..."
-            words = [int(w, 16) for w in parts[2:2+N]]
-            session.set_gba_words(words)
-        """
-        u16s: list = []
-        for w in u32_words:
-            u16s.append(int(w) & 0xFFFF)
-            u16s.append((int(w) >> 16) & 0xFFFF)
-        self._engine.set_gba_slot((u16s + [0] * 7)[:7])
+        """Backward-compatible alias for queue_gba_wire_words()."""
+        self.queue_gba_wire_words(u32_words)
 
     def drain_frames(self) -> list:
-        """Return and clear all Switch UNI frames received since the last call.
+        """Return and clear all parsed Switch parent frames since the last call.
 
         Each element is a dict from gbaframe.parse_in():
           "type"       : frame type byte ('T', 'A', 'D', …)
@@ -356,6 +449,15 @@ class SwitchSession:
         return self._sim.connected
 
     @property
+    def rfu_ready(self) -> bool:
+        """True once the Switch accepted the emulator RFU connect ('A').
+
+        LinkBridge must not tell the physical GBA that connection is complete
+        before this point, or the GBA can begin NI before the Switch is ready.
+        """
+        return bool(self._sim._gba_accepted)
+
+    @property
     def join_ok(self) -> bool:
         """True if the Switch returned JOIN_GROUP_OK (5) in its NI handshake."""
         return self._join_status_raw == JOIN_GROUP_OK
@@ -368,7 +470,7 @@ class SwitchSession:
     @property
     def ni_done(self) -> bool:
         """True once both NI handshakes are done and UNI slot exchange has begun."""
-        return self._sim._ni_done
+        return bool(self._sim._ni_done or self._sim._host_uni_seen)
 
     @property
     def host_ni_bytes(self) -> bytes:
